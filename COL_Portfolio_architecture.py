@@ -810,9 +810,14 @@ class CurveShockGenerator:
         if self.changes_ is None:
             raise RuntimeError("Ejecute simulate() o from_history() primero.")
         mats = np.asarray(maturities, dtype=float)
-        vals = np.vstack([
-            np.interp(mats, self.tenors, row) for row in self.changes_.values
-        ])
+        # Interpolación lineal por columnas (equivale a np.interp fila a fila,
+        # con extrapolación plana en los extremos, pero vectorizada).
+        t = self.tenors
+        m = np.clip(mats, t[0], t[-1])
+        j = np.clip(np.searchsorted(t, m, side="right") - 1, 0, len(t) - 2)
+        w = (m - t[j]) / (t[j + 1] - t[j])
+        c = self.changes_.to_numpy()
+        vals = c[:, j] * (1.0 - w) + c[:, j + 1] * w
         return pd.DataFrame(vals, index=self.changes_.index, columns=mats)
 
     # ------------------------------------------------------------------ #
@@ -995,9 +1000,11 @@ class BondScreener:
     convierte los aprobados en activos candidatos con μ, duración modificada
     y convexidad calculados sobre la curva vigente.
 
-    El retorno diario de cada bono aprobado se modela igual que los nodos TES,
-    con el Δy interpolado al plazo residual del título y un spread de crédito
-    constante sobre la curva soberana.
+    A diferencia de los nodos TES (plazo constante), un bono envejece: su
+    plazo residual se acorta con el tiempo y vence en una fecha contractual.
+    Por eso su retorno diario se obtiene revaluando los flujos que le quedan
+    con la curva vigente de cada día más su spread, y tras el vencimiento el
+    capital se reinvierte a la tasa de la curva al plazo `reinvest_tenor`.
     """
 
     def __init__(
@@ -1006,13 +1013,17 @@ class BondScreener:
         criteria: Optional[BondScreeningCriteria] = None,
         curve: Optional[TESYieldCurve] = None,
         as_of: Optional[Union[str, datetime]] = None,
+        reinvest_tenor: float = RF_TENOR_YEARS,
     ) -> None:
         self.bonds = list(bonds)
+        self._bonds_by_isin: Dict[str, BondSpec] = {b.isin: b for b in self.bonds}
         self.criteria = criteria or BondScreeningCriteria()
         self.curve = curve or TESYieldCurve.synthetic_example()
         self.as_of = pd.Timestamp(as_of) if as_of is not None else pd.Timestamp.today()
+        self.reinvest_tenor = float(reinvest_tenor)
         self.report_: Optional[pd.DataFrame] = None
         self.approved_: List[AssetSpec] = []
+        self.spread_paths_: Optional[pd.DataFrame] = None  # spread simulado (decimal) por bono y fecha
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -1080,26 +1091,52 @@ class BondScreener:
 
     # ------------------------------------------------------------------ #
     def _rejection_reason(self, bond: BondSpec, a: Dict[str, float]) -> Optional[str]:
+        return self._static_rejection(bond) or self._dynamic_rejection(a)
+
+    # ------------------------------------------------------------------ #
+    def _static_rejection(self, bond: BondSpec) -> Optional[str]:
+        """Criterios propios del título, que no cambian con el paso del tiempo."""
         c = self.criteria
         rating_rank = RATING_SCALE.get(bond.rating.upper())
         if rating_rank is None:
             return f"rating desconocido ({bond.rating})"
         if rating_rank > RATING_SCALE[c.min_rating.upper()]:
             return f"rating {bond.rating} < mínimo {c.min_rating}"
-        if not (c.min_maturity_years <= a["plazo_anios"] <= c.max_maturity_years):
-            return (f"plazo {a['plazo_anios']:.2f}A fuera de "
-                    f"[{c.min_maturity_years:g}, {c.max_maturity_years:g}]")
         if bond.liquidez < c.min_liquidez:
             return f"liquidez {bond.liquidez:.2f} < {c.min_liquidez:.2f}"
-        if c.min_ytm is not None and a["ytm"] < c.min_ytm:
-            return f"YTM {a['ytm']*100:.2f}% < mínimo {c.min_ytm*100:.2f}%"
-        if c.max_spread_bp is not None and a["spread_bp"] > c.max_spread_bp:
-            return f"spread {a['spread_bp']:.0f}pb > máximo {c.max_spread_bp:.0f}pb"
         if c.indexaciones_permitidas and bond.indexacion not in c.indexaciones_permitidas:
             return f"indexación {bond.indexacion} no permitida"
         if bond.emisor in c.emisores_excluidos:
             return "emisor excluido por política"
         return None
+
+    # ------------------------------------------------------------------ #
+    def _dynamic_rejection(self, a: Mapping[str, float]) -> Optional[str]:
+        """Criterios que dependen de la fecha: plazo residual, YTM y spread."""
+        c = self.criteria
+        if not (c.min_maturity_years <= a["plazo_anios"] <= c.max_maturity_years):
+            return (f"plazo {a['plazo_anios']:.2f}A fuera de "
+                    f"[{c.min_maturity_years:g}, {c.max_maturity_years:g}]")
+        if c.min_ytm is not None and a["ytm"] < c.min_ytm:
+            return f"YTM {a['ytm']*100:.2f}% < mínimo {c.min_ytm*100:.2f}%"
+        if c.max_spread_bp is not None and a["spread_bp"] > c.max_spread_bp:
+            return f"spread {a['spread_bp']:.0f}pb > máximo {c.max_spread_bp:.0f}pb"
+        return None
+
+    # ------------------------------------------------------------------ #
+    def _cap_per_issuer(self, candidates: pd.DataFrame) -> pd.Index:
+        """
+        Índices que exceden el máximo de títulos por emisor. Se conservan los de
+        mayor YTM ajustada por liquidez (columnas 'emisor', 'ytm', 'liquidez').
+        """
+        drop: List[object] = []
+        if self.criteria.max_por_emisor > 0 and not candidates.empty:
+            score = candidates["ytm"] * candidates["liquidez"]
+            for _, grp in candidates.groupby("emisor"):
+                if len(grp) > self.criteria.max_por_emisor:
+                    ranked = score.loc[grp.index].sort_values(ascending=False)
+                    drop.extend(ranked.index[self.criteria.max_por_emisor:])
+        return pd.Index(drop)
 
     # ------------------------------------------------------------------ #
     def screen(self) -> pd.DataFrame:
@@ -1122,16 +1159,11 @@ class BondScreener:
 
         # Límite de concentración por emisor: se conservan los títulos de mayor
         # YTM ajustada por liquidez dentro de cada emisor aprobado.
-        if self.criteria.max_por_emisor > 0:
-            report["_score"] = report["ytm"] * report["liquidez"]
-            for emisor, grp in report[report["aprobado"]].groupby("emisor"):
-                if len(grp) > self.criteria.max_por_emisor:
-                    drop = grp.sort_values("_score", ascending=False).index[self.criteria.max_por_emisor:]
-                    report.loc[drop, "aprobado"] = False
-                    report.loc[drop, "motivo_rechazo"] = (
-                        f"excede máximo de {self.criteria.max_por_emisor} títulos por emisor"
-                    )
-            report = report.drop(columns="_score")
+        drop = self._cap_per_issuer(report[report["aprobado"]])
+        report.loc[drop, "aprobado"] = False
+        report.loc[drop, "motivo_rechazo"] = (
+            f"excede máximo de {self.criteria.max_por_emisor} títulos por emisor"
+        )
 
         self.report_ = report
         logger.info(
@@ -1142,10 +1174,57 @@ class BondScreener:
 
     # ------------------------------------------------------------------ #
     def approved_specs(self, include_rolldown: bool = True) -> List[AssetSpec]:
-        """Convierte los bonos aprobados en activos candidatos del optimizador."""
+        """Convierte los bonos aprobados en `as_of` en activos candidatos del optimizador."""
         report = self.report_ if self.report_ is not None else self.screen()
+        specs = self._specs_from_rows(report[report["aprobado"]], include_rolldown)
+        self.approved_ = specs
+        return specs
+
+    # ------------------------------------------------------------------ #
+    def candidate_specs(
+        self, until: Union[str, pd.Timestamp], include_rolldown: bool = True
+    ) -> List[AssetSpec]:
+        """
+        Bonos que podrían ser elegibles en algún momento entre `as_of` y
+        `until`: cumplen los criterios estáticos (rating, liquidez, indexación,
+        emisor) y su plazo residual cruza la banda de plazo permitida en esa
+        ventana. La elegibilidad efectiva se decide fecha a fecha con
+        `eligible_at`.
+        """
+        report = self.report_ if self.report_ is not None else self.screen()
+        tau_end = float(self._years_since_as_of(pd.Timestamp(until))[0])
+        c = self.criteria
+        keep = [
+            isin for isin, row in report.iterrows()
+            if self._static_rejection(self._bonds_by_isin[isin]) is None
+            and row["plazo_anios"] >= c.min_maturity_years
+            and row["plazo_anios"] - tau_end <= c.max_maturity_years
+        ]
+        return self._specs_from_rows(report.loc[keep], include_rolldown)
+
+    # ------------------------------------------------------------------ #
+    def eligible_at(
+        self, specs: Sequence[AssetSpec], curve: TESYieldCurve, date: Union[str, pd.Timestamp]
+    ) -> List[str]:
+        """
+        Screening en la fecha `date`: aplica los criterios dependientes del
+        tiempo (plazo residual, YTM, spread vigente) y el máximo por emisor.
+        Sólo usa información disponible en esa fecha.
+        """
+        rows: Dict[str, Dict[str, object]] = {}
+        for spec in specs:
+            a = self.analytics_at(spec, curve, date, include_rolldown=False)
+            if a["vencido"] or self._dynamic_rejection(a) is not None:
+                continue
+            rows[spec.ticker] = {"emisor": spec.metadata["emisor"], "ytm": a["ytm"],
+                                 "liquidez": float(spec.metadata["liquidez"])}
+        passed = pd.DataFrame.from_dict(rows, orient="index")
+        return [tk for tk in passed.index if tk not in self._cap_per_issuer(passed)]
+
+    # ------------------------------------------------------------------ #
+    def _specs_from_rows(self, rows: pd.DataFrame, include_rolldown: bool) -> List[AssetSpec]:
         specs: List[AssetSpec] = []
-        for isin, row in report[report["aprobado"]].iterrows():
+        for isin, row in rows.iterrows():
             ttm = float(row["plazo_anios"])
             dmod = float(row["duracion_mod"])
             rolldown = 0.0
@@ -1165,11 +1244,11 @@ class BondScreener:
                 metadata={
                     "isin": isin, "emisor": row["emisor"], "rating": row["rating"],
                     "sector": row["sector"], "plazo_anios": ttm,
+                    "vencimiento": pd.Timestamp(self._bonds_by_isin[isin].maturity_date).strftime("%Y-%m-%d"),
                     "spread_bp": float(row["spread_bp"]), "liquidez": float(row["liquidez"]),
                     "indexacion": row["indexacion"], "rolldown": rolldown,
                 },
             ))
-        self.approved_ = specs
         return specs
 
     # ------------------------------------------------------------------ #
@@ -1181,27 +1260,131 @@ class BondScreener:
         seed: int = 77,
     ) -> pd.DataFrame:
         """
-        Retornos simples diarios de los bonos aprobados: carry + sensibilidad a
-        la curva soberana (D_mod, convexidad) + un componente idiosincrático de
-        spread crediticio escalado por la (i)liquidez del título.
+        Retornos simples diarios de los bonos aprobados por revaluación
+        completa: cada día se descuentan los flujos que le quedan al título a
+        su YTM vigente,
+
+            YTM_t = z_t(plazo_t) + spread_t,     plazo_t = plazo_0 − τ_t
+
+        donde z_t es la curva simulada de ese día y el spread sigue una
+        caminata aleatoria escalada por la (i)liquidez del título. El retorno
+        total incluye el cupón cobrado en el día:
+
+            r_t = (P_t + cupón_t) / P_{t−1} − 1
+
+        Así el plazo, la duración y la convexidad se acortan con el tiempo y el
+        precio converge a la par. Tras el vencimiento el capital se reinvierte
+        a la tasa de la curva al plazo `reinvest_tenor`.
         """
         bond_specs = list(specs or self.approved_specs())
         if not bond_specs:
             return pd.DataFrame(index=shocks.changes_.index if shocks.changes_ is not None else None)
+        if shocks.levels_ is None:
+            raise RuntimeError("Ejecute simulate() o from_history() en el generador de choques primero.")
 
-        dy = shocks.changes_at([float(s.metadata["plazo_anios"]) for s in bond_specs])
+        levels = shocks.levels_
+        tenors = np.asarray(levels.columns, dtype=float)
+        level_rows = levels.to_numpy()
+        tau = self._years_since_as_of(levels.index)
+        d_tau = np.diff(tau, prepend=tau[0])
+        reinvest = np.array([np.interp(self.reinvest_tenor, tenors, row) for row in level_rows])
+        cash_ret = (1.0 + reinvest) ** d_tau - 1.0
+
         rng = np.random.default_rng(seed)
         out: Dict[str, pd.Series] = {}
-        for spec, col in zip(bond_specs, dy.columns):
+        spreads: Dict[str, pd.Series] = {}
+        for spec in bond_specs:
+            pay_t, cfs = self._cashflow_calendar(spec)
+            ttm0 = float(spec.metadata["plazo_anios"])
+
             liq = float(spec.metadata.get("liquidez", 0.5))
-            spread_shock = rng.normal(0.0, (spread_vol_bp / 1e4) * (1.5 - liq), size=len(dy))
-            total_dy = dy[col].values + spread_shock
-            carry_daily = (1.0 + float(spec.ytm)) ** (1.0 / TRADING_DAYS) - 1.0
-            price_ret = BondAnalytics.price_return(
-                total_dy, float(spec.modified_duration), float(spec.convexity)
-            )
-            out[spec.ticker] = pd.Series(carry_daily + price_ret, index=dy.index)
+            spread_shock = rng.normal(0.0, (spread_vol_bp / 1e4) * (1.5 - liq), size=len(levels))
+            spread = float(spec.metadata["spread_bp"]) / 1e4 + np.cumsum(spread_shock)
+
+            ttm = np.maximum(ttm0 - tau, 0.0)
+            zero = np.array([np.interp(m, tenors, row) for m, row in zip(ttm, level_rows)])
+            ytm = zero + spread
+
+            # Matriz (fechas x flujos): tiempo hasta cada pago y flujos pendientes.
+            t_to_pay = pay_t[None, :] - tau[:, None]
+            pending = t_to_pay > 0.0
+            disc = (1.0 + ytm[:, None]) ** (-np.where(pending, t_to_pay, 0.0))
+            price = np.where(pending, cfs[None, :] * disc, 0.0).sum(axis=1)
+            paid = np.zeros(len(tau))
+            paid[1:] = (cfs[None, :] * (pending[:-1] & ~pending[1:])).sum(axis=1)
+
+            ret = np.zeros(len(tau))
+            alive_prev = pending[:-1].any(axis=1)          # el bono existía al cierre anterior
+            prev_price = price[:-1]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                bond_ret = (price[1:] + paid[1:]) / prev_price - 1.0
+            ret[1:] = np.where(alive_prev, bond_ret, cash_ret[1:])
+
+            out[spec.ticker] = pd.Series(ret, index=levels.index)
+            spreads[spec.ticker] = pd.Series(spread, index=levels.index)
+
+            if tau[-1] >= ttm0:
+                logger.info(
+                    "%s vence el %s dentro de la ventana: desde entonces su serie rinde la tasa "
+                    "de reinversión (curva a %.2g años); deja de ser invertible antes, al "
+                    "bajar del plazo mínimo del screening.",
+                    spec.ticker, spec.metadata.get("vencimiento", "?"), self.reinvest_tenor,
+                )
+
+        self.spread_paths_ = pd.DataFrame(spreads)
         return pd.DataFrame(out)
+
+    # ------------------------------------------------------------------ #
+    def _years_since_as_of(self, dates: Union[pd.DatetimeIndex, pd.Timestamp]) -> np.ndarray:
+        """Años (ACT/365.25) transcurridos desde `as_of`, misma base que el plazo residual."""
+        idx = pd.DatetimeIndex([dates]) if isinstance(dates, pd.Timestamp) else pd.DatetimeIndex(dates)
+        return np.asarray((idx - self.as_of).days, dtype=float) / 365.25
+
+    # ------------------------------------------------------------------ #
+    def _cashflow_calendar(self, spec: AssetSpec) -> Tuple[np.ndarray, np.ndarray]:
+        """Fechas de pago (años desde `as_of`) y montos de los flujos del bono."""
+        bond = self._bonds_by_isin[str(spec.metadata["isin"])]
+        return BondAnalytics.cashflow_schedule(
+            float(spec.metadata["plazo_anios"]), bond.coupon_rate, bond.freq, bond.face
+        )
+
+    # ------------------------------------------------------------------ #
+    def analytics_at(
+        self,
+        spec: AssetSpec,
+        curve: TESYieldCurve,
+        date: Union[str, pd.Timestamp],
+        include_rolldown: bool = True,
+    ) -> Dict[str, float]:
+        """
+        Plazo residual, YTM, duración modificada, convexidad, spread, roll-down y μ del bono en
+        `date` con la curva dada. Usa el spread simulado vigente en esa fecha
+        (conocido en t, sin mirar el futuro). Si el bono ya venció, μ es la
+        tasa de reinversión.
+        """
+        date = pd.Timestamp(date)
+        tau = float(self._years_since_as_of(date)[0])
+        pay_t, cfs = self._cashflow_calendar(spec)
+        pending = pay_t > tau
+        if not pending.any():
+            rate = float(curve.get_rate(self.reinvest_tenor))
+            return {"plazo_anios": 0.0, "ytm": rate, "duracion_mod": 0.0, "convexidad": 0.0,
+                    "spread_bp": 0.0, "rolldown": 0.0, "mu": rate, "vencido": 1.0}
+
+        spread = float(spec.metadata["spread_bp"]) / 1e4
+        if self.spread_paths_ is not None and spec.ticker in self.spread_paths_:
+            path = self.spread_paths_[spec.ticker]
+            pos = int(np.clip(path.index.searchsorted(date, side="right") - 1, 0, len(path) - 1))
+            spread = float(path.iloc[pos])
+
+        ttm = float(pay_t[-1] - tau)
+        ytm = float(curve.get_rate(ttm)) + spread
+        _, dmod, conv = BondAnalytics.duration_convexity(pay_t[pending] - tau, cfs[pending], ytm)
+        rolldown = 0.0
+        if include_rolldown and ttm > 1.0:
+            rolldown = dmod * (float(curve.get_rate(ttm)) - float(curve.get_rate(ttm - 1.0)))
+        return {"plazo_anios": ttm, "ytm": ytm, "duracion_mod": dmod, "convexidad": conv,
+                "spread_bp": spread * 1e4, "rolldown": rolldown, "mu": ytm + rolldown, "vencido": 0.0}
 
     # ------------------------------------------------------------------ #
     def plot_screening(self) -> go.Figure:
@@ -1308,8 +1491,14 @@ class FixedIncomeEngine:
         node_specs = self.node_builder.build_specs()
         node_returns = self.node_builder.build_returns(self.shocks, node_specs)
 
+        # Se modelan todos los bonos que podrían ser elegibles en algún momento
+        # de la ventana; cuáles son invertibles se decide en cada fecha con
+        # `excluded_bonds_at` (screening dinámico).
         self.screener.screen()
-        bond_specs = self.screener.approved_specs(include_rolldown=self.include_rolldown)
+        approved_now = self.screener.approved_specs(include_rolldown=self.include_rolldown)
+        bond_specs = self.screener.candidate_specs(
+            until=pd.DatetimeIndex(dates)[-1], include_rolldown=self.include_rolldown
+        )
         bond_returns = self.screener.build_returns(self.shocks, bond_specs)
 
         returns = pd.concat([node_returns, bond_returns], axis=1) if not bond_returns.empty else node_returns
@@ -1327,10 +1516,70 @@ class FixedIncomeEngine:
             curve_levels=self.shocks.levels_,
         )
         logger.info(
-            "Renta Fija ensamblada: %d nodos TES (A) + %d bonos aprobados (C) sobre %d días.",
-            len(node_specs), len(bond_specs), len(returns),
+            "Renta Fija ensamblada: %d nodos TES (A) + %d bonos candidatos (C; %d aprobados al "
+            "inicio, el resto entra o sale según su plazo) sobre %d días.",
+            len(node_specs), len(bond_specs), len(approved_now), len(returns),
         )
         return self.bundle_
+
+    # ------------------------------------------------------------------ #
+    def _bond_specs(self) -> List[AssetSpec]:
+        if self.bundle_ is None:
+            raise RuntimeError("Ejecute build() primero.")
+        return [s for s in self.bundle_.specs.values() if s.sub_class is AssetSubClass.RF_BONO]
+
+    # ------------------------------------------------------------------ #
+    def excluded_bonds_at(self, date: Union[str, pd.Timestamp]) -> Set[str]:
+        """
+        Bonos candidatos que NO son invertibles en `date`: vencidos, fuera de
+        la banda de plazo, con spread o YTM fuera de política, o que exceden el
+        máximo por emisor. El screening se repite con la curva y el spread
+        vigentes en esa fecha.
+        """
+        specs = self._bond_specs()
+        crv = self.shocks.curve_at(pd.Timestamp(date))
+        eligible = set(self.screener.eligible_at(specs, crv, date))
+        return {s.ticker for s in specs} - eligible
+
+    # ------------------------------------------------------------------ #
+    def proforma_log_returns(
+        self, date: Union[str, pd.Timestamp], window: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Reemplaza, dentro de una ventana de retornos log, la serie de cada bono
+        por su versión *pro-forma*: los choques históricos de curva y spread
+        aplicados a las características que el bono tiene HOY (plazo, YTM,
+        duración y convexidad en `date`),
+
+            r_s = carry(YTM_hoy) − D_hoy·Δy_s + ½·C_hoy·Δy_s²,
+            Δy_s = Δz_s(plazo_hoy) + Δspread_s
+
+        Sin este ajuste la covarianza reflejaría la duración que el bono tenía
+        durante la ventana (mayor que la actual) y sobreestimaría su riesgo.
+        """
+        date = pd.Timestamp(date)
+        out = window.copy()
+        crv = self.shocks.curve_at(date)
+        levels_idx = self.shocks.levels_.index
+        d_tau = pd.Series(
+            np.diff(self.screener._years_since_as_of(levels_idx), prepend=np.nan), index=levels_idx
+        )
+        spreads = self.screener.spread_paths_
+        for tk in window.columns:
+            spec = self.bundle_.specs.get(tk) if self.bundle_ is not None else None
+            if spec is None or spec.sub_class is not AssetSubClass.RF_BONO:
+                continue
+            a = self.screener.analytics_at(spec, crv, date, include_rolldown=False)
+            if a["vencido"]:
+                continue
+            dz = self.shocks.changes_at([a["plazo_anios"]]).iloc[:, 0]
+            ds = spreads[tk].diff() if spreads is not None and tk in spreads else 0.0 * dz
+            dy = (dz + ds).reindex(window.index).fillna(0.0).to_numpy()
+            dt = d_tau.reindex(window.index).fillna(1.0 / 365.25).to_numpy()
+            carry = (1.0 + a["ytm"]) ** dt - 1.0
+            simple = carry - a["duracion_mod"] * dy + 0.5 * a["convexidad"] * dy ** 2
+            out[tk] = np.log1p(simple)
+        return out
 
     # ------------------------------------------------------------------ #
     def expected_returns_at(self, date: Union[str, pd.Timestamp]) -> pd.Series:
@@ -1347,18 +1596,12 @@ class FixedIncomeEngine:
         for spec in self.node_builder.build_specs(crv):
             mu[spec.ticker] = float(spec.expected_return)
 
+        # Los bonos se evalúan con su plazo residual en `date`, no con el de la
+        # fecha de screening; los ya vencidos rinden la tasa de reinversión.
         for ticker, spec in self.bundle_.specs.items():
             if spec.sub_class is not AssetSubClass.RF_BONO:
                 continue
-            ttm = float(spec.metadata["plazo_anios"])
-            spread = float(spec.metadata["spread_bp"]) / 1e4
-            ytm_t = float(crv.get_rate(ttm)) + spread
-            rolldown = 0.0
-            if self.include_rolldown and ttm > 1.0:
-                rolldown = float(spec.modified_duration) * (
-                    float(crv.get_rate(ttm)) - float(crv.get_rate(ttm - 1.0))
-                )
-            mu[ticker] = ytm_t + rolldown
+            mu[ticker] = self.screener.analytics_at(spec, crv, date, self.include_rolldown)["mu"]
 
         return pd.Series(mu, name="mu_rf")
 
@@ -1847,6 +2090,12 @@ class WalkForwardBacktester:
     (`expected_returns_fn`) — típicamente la YTM + roll-down leída de la curva
     TES vigente en ese momento — así como una tasa libre de riesgo variable
     (`rf_fn`).
+
+    El universo invertible también puede variar por fecha: `exclude_fn(fecha)`
+    devuelve los activos que no son elegibles en ese rebalanceo (p. ej. bonos
+    fuera de la banda de plazo o vencidos) y `window_fn(fecha, ventana)`
+    permite ajustar la ventana de estimación (p. ej. retornos pro-forma de los
+    bonos con sus características vigentes).
     """
 
     def __init__(
@@ -1861,6 +2110,8 @@ class WalkForwardBacktester:
         group_constraints: Optional[Sequence[GroupConstraint]] = None,
         expected_returns_fn: Optional[Callable[[pd.Timestamp], pd.Series]] = None,
         rf_fn: Optional[Callable[[pd.Timestamp], float]] = None,
+        exclude_fn: Optional[Callable[[pd.Timestamp], Set[str]]] = None,
+        window_fn: Optional[Callable[[pd.Timestamp, pd.DataFrame], pd.DataFrame]] = None,
     ) -> None:
         self.prices = prices.dropna(how="any")
         self.returns = MarketDataPipeline.compute_returns(self.prices, method="log")
@@ -1873,6 +2124,8 @@ class WalkForwardBacktester:
         self.group_constraints = list(group_constraints or [])
         self.expected_returns_fn = expected_returns_fn
         self.rf_fn = rf_fn
+        self.exclude_fn = exclude_fn
+        self.window_fn = window_fn
 
         self.asset_groups: Dict[str, str] = {
             tk: spec.asset_class.value for tk, spec in self.asset_specs.items()
@@ -1888,6 +2141,7 @@ class WalkForwardBacktester:
         self.portfolio_returns_: Optional[pd.Series] = None
         self.equity_curve_: Optional[pd.Series] = None
         self.rf_used_: Optional[pd.Series] = None
+        self.excluded_history_: Dict[pd.Timestamp, Set[str]] = {}
 
     # ------------------------------------------------------------------ #
     def _rebalance_dates(self) -> List[pd.Timestamp]:
@@ -1899,6 +2153,15 @@ class WalkForwardBacktester:
         # Solo fechas con al menos `lookback_days` de historia disponible
         valid = [pd.Timestamp(d) for d in dates if (idx <= d).sum() >= self.lookback_days]
         return valid
+
+    # ------------------------------------------------------------------ #
+    def _in_sample(self, reb_date: pd.Timestamp) -> pd.DataFrame:
+        """Ventana de estimación con sólo los activos invertibles en `reb_date`."""
+        window = self.returns.loc[:reb_date].tail(self.lookback_days)
+        excluded = set(self.exclude_fn(reb_date)) if self.exclude_fn else set()
+        self.excluded_history_[reb_date] = excluded & set(window.columns)
+        window = window.drop(columns=sorted(self.excluded_history_[reb_date]))
+        return self.window_fn(reb_date, window) if self.window_fn else window
 
     # ------------------------------------------------------------------ #
     def _build_optimizer(
@@ -1951,8 +2214,9 @@ class WalkForwardBacktester:
         rf_records: Dict[pd.Timestamp, float] = {}
         daily_portfolio_returns: List[pd.Series] = []
 
+        self.excluded_history_ = {}
         for i, reb_date in enumerate(rebal_dates):
-            in_sample = self.returns.loc[:reb_date].tail(self.lookback_days)
+            in_sample = self._in_sample(reb_date)
             try:
                 w, rf_t = self._optimize_weights(in_sample, reb_date)
             except Exception as exc:  # robustez ante ventanas degeneradas
@@ -2478,10 +2742,22 @@ def main() -> None:
     # μ analítico de la RF: YTM + roll-down de la curva vigente al cierre.
     # Se convierte a escala logarítmica porque la matriz de momentos se estima
     # sobre retornos log: μ_log = ln(1 + μ_efectiva).
-    mu_rf_hoy = np.log1p(fi_engine.expected_returns_at(multi_returns.index[-1]))
+    fecha_cierre = multi_returns.index[-1]
+    mu_rf_hoy = np.log1p(fi_engine.expected_returns_at(fecha_cierre))
+
+    # Screening al cierre: sólo los bonos elegibles hoy, con retornos
+    # pro-forma (choques históricos aplicados a su plazo y duración actuales).
+    bonos_no_elegibles = fi_engine.excluded_bonds_at(fecha_cierre)
+    if bonos_no_elegibles:
+        logger.info("Bonos no elegibles al %s (plazo, spread o emisor): %s",
+                    fecha_cierre.date(), sorted(bonos_no_elegibles))
+    retornos_estrategicos = fi_engine.proforma_log_returns(
+        fecha_cierre,
+        multi_returns.drop(columns=sorted(bonos_no_elegibles & set(multi_returns.columns))),
+    )
 
     optimizer = PortfolioOptimizer(
-        multi_returns,
+        retornos_estrategicos,
         rf=rf_tes,
         max_weight=policy.max_weights(specs),
         shrinkage=USAR_SHRINKAGE_LEDOIT_WOLF,
@@ -2531,9 +2807,28 @@ def main() -> None:
         # cada fecha de rebalanceo (la RV sigue usando su media muestral).
         expected_returns_fn=lambda d: np.log1p(fi_engine.expected_returns_at(d)),
         rf_fn=lambda d: fi_engine.risk_free_at(d, policy.rf_tenor_years),
+        # Screening dinámico de bonos y covarianza con retornos pro-forma.
+        exclude_fn=fi_engine.excluded_bonds_at,
+        window_fn=fi_engine.proforma_log_returns,
     )
     weights_history = backtester.run()
     perf_summary = backtester.performance_summary()
+
+    bonos = [tk for tk, sp in specs.items() if sp.sub_class is AssetSubClass.RF_BONO]
+    elegibles = pd.DataFrame({
+        d: {tk: tk not in excl for tk in bonos} for d, excl in backtester.excluded_history_.items()
+    }).T
+    fechas_elegible = {tk: elegibles.index[elegibles[tk]] for tk in bonos}
+    tabla_elegibilidad = pd.DataFrame({
+        "vencimiento": {tk: specs[tk].metadata["vencimiento"] for tk in bonos},
+        "rebalanceos_elegible": {tk: f"{int(elegibles[tk].sum())}/{len(elegibles)}" for tk in bonos},
+        "primer_rebalanceo": {tk: (f[0].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
+        "ultimo_rebalanceo": {tk: (f[-1].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
+        "peso_medio_%_cuando_elegible": {
+            tk: (float(weights_history.loc[f, tk].mean() * 100) if len(f) and tk in weights_history else 0.0)
+            for tk, f in fechas_elegible.items()
+        },
+    })
 
     print("\n--- Asignación por clase de activo en cada rebalanceo (%) ---")
     print((backtester.class_weights_history_ * 100).round(2).to_string())
@@ -2546,6 +2841,8 @@ def main() -> None:
     print(backtester.band_compliance().to_string())
     print("\n--- Desempeño fuera de muestra ---")
     print(pd.Series(perf_summary, name="valor").round(4).to_string())
+    print("\n--- Elegibilidad de bonos en el backtest (screening dinámico) ---")
+    print(tabla_elegibilidad.round(2).to_string())
 
     # ---------------------------------------------------------------- #
     # 8) REPORTE HTML INTERACTIVO
@@ -2568,7 +2865,10 @@ def main() -> None:
         f"{nota_b}; y "
         f"<b>(C)</b> {n_bonos} bonos individuales que superan el filtro de rating, plazo, liquidez "
         "y spread. El μ de (A) y (C) es analítico (YTM + roll-down), no una media muestral, y se "
-        "recalcula con la curva vigente en cada rebalanceo."
+        "recalcula con la curva vigente en cada rebalanceo. Los bonos envejecen: se revalúan a "
+        "diario con su plazo residual, el screening se repite en cada rebalanceo (un título entra "
+        "o sale según su plazo y spread vigentes) y su covarianza se estima con retornos pro-forma "
+        "que aplican los choques históricos a su duración actual."
     )
     if descartados:
         report.add_note(
@@ -2585,11 +2885,15 @@ def main() -> None:
         fi_bundle.analytics.drop(columns=[c for c in ("nombre",) if c in fi_bundle.analytics.columns]),
     )
     report.add_table(
-        "Screening de bonos — veredicto por título",
+        "Screening de bonos — veredicto por título (al inicio de la ventana)",
         fi_bundle.screening_report[
             ["emisor", "rating", "plazo_anios", "ytm", "duracion_mod", "spread_bp",
              "liquidez", "aprobado", "motivo_rechazo"]
         ],
+    )
+    report.add_table(
+        "Screening dinámico — elegibilidad de cada bono en los rebalanceos",
+        tabla_elegibilidad, "{:.2f}",
     )
     report.add_chart("Frontera Eficiente Multi-Activo", optimizer.plot_efficient_frontier(n_portfolios=3000))
     report.add_table("Portafolio estratégico óptimo (peso > 0.01%)",

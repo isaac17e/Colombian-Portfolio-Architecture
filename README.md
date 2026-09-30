@@ -58,6 +58,12 @@ The fixed-income leg combines three approaches:
   - fixed-rate peso bonds only (no UVR/IPC);
   - at most 2 bonds per issuer.
 
+Individual bonds **age through time**:
+- **Daily repricing.** Each bond is priced from its remaining cash flows. The yield is the day's curve at the bond's current residual maturity plus a credit spread that follows a random walk scaled by illiquidity. Returns include coupons, and the price pulls to par.
+- **Dynamic screening.** At every rebalance, the time-dependent criteria (maturity band, spread, YTM, issuer limit) are re-applied with that date's data. A bond enters the investable universe when it falls inside the band and leaves it when its remaining maturity drops below the 1-year minimum, so it never reaches maturity while held.
+- **Pro-forma covariance.** Inside each estimation window, a bond's returns are rebuilt by applying the historical curve and spread moves to its *current* maturity, duration and convexity. Without this, the window would reflect the longer duration the bond used to have and overstate its risk.
+- The screening table at the start date is kept for reference, and the report adds a table with each bond's eligible rebalances.
+
 Daily yield-curve changes come from a **three-factor Nelson-Siegel model** (level, slope, curvature) with mean reversion and a link to equity returns (`CurveShockGenerator`). A real curve history can replace it through `from_history`.
 
 The expected return (μ) of A and C is **analytical** (YTM + roll-down), not a sample mean. It is recomputed from the curve in force at each rebalance date, which is the tactical part of the allocation.
@@ -124,7 +130,6 @@ All settings live in the **`PARÁMETROS EDITABLES`** block at the top of the scr
 ## Known limitations
 
 - **Fixed income is modeled, not observed.** Unless you load a real curve history, the TES nodes and bonds follow a simulated path around a fixed base curve, so their returns do not reflect actual market episodes (for example, the 2022 TES sell-off).
-- **Bond maturities are static.** Residual maturity and duration are computed once at the start date and do not roll down through the backtest; a bond can stay in the portfolio past its maturity date.
 - **Equity μ is a sample mean** (full sample in the strategic optimization, 252-day window in the backtest). It is noisy, and a maximum Sharpe optimizer amplifies that noise.
 - **Yahoo Finance data for BVC tickers** fills Colombian holidays with the previous close. Even liquid stocks show about 10% of days with zero return, which is why the illiquidity threshold is set at 25%.
 
