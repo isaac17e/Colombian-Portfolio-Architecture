@@ -147,6 +147,21 @@ EXCLUIR_ACTIVOS_SIN_PRECIO_REAL: bool = True
 MIN_ACTIVOS_RV_REALES: int = 5
 SEMILLA_ALEATORIA: int = 42
 
+# --- Liquidez y cobertura de precios -----------------------------------------
+# Un precio que no se mueve no es un activo sin riesgo: es un activo sin
+# negociación. Sus retornos en cero subestiman volatilidad y correlaciones, y el
+# optimizador de Sharpe lo premia. Se mide sobre la serie propia de cada ticker;
+# Yahoo rellena los festivos de la BVC con el cierre anterior, por lo que aun las
+# acciones más líquidas muestran ~10% de días sin movimiento.
+MAX_PCT_DIAS_SIN_MOVIMIENTO: float = 0.25   # fracción máxima de días con retorno exactamente 0
+MAX_DIAS_PRECIO_CONGELADO: int = 30         # racha máxima de días seguidos con el mismo precio
+# Días máximos que se arrastra un precio al alinear calendarios. Sin tope, un
+# título que deja de cotizar (p. ej. por conversión o deslistamiento) seguiría
+# con precio plano hasta el final de la ventana en vez de quedar sin dato.
+MAX_DIAS_RELLENO_PRECIO: int = 5
+# Holgura (días calendario) para exigir dato real al inicio y al final de la ventana.
+HOLGURA_COBERTURA_DIAS: int = 45
+
 # --- Volatilidad de la curva (modelo de 3 factores, puntos básicos diarios) ---
 CURVA_VOL_NIVEL_BP: float = 5.5
 CURVA_VOL_PENDIENTE_BP: float = 3.5
@@ -292,21 +307,25 @@ class MarketDataPipeline:
         start: Union[str, datetime],
         end: Union[str, datetime],
         seed: int = 42,
+        max_fill_days: Optional[int] = MAX_DIAS_RELLENO_PRECIO,
     ) -> None:
         self.tickers = list(tickers)
         self.start = pd.Timestamp(start)
         self.end = pd.Timestamp(end)
         self.seed = int(seed)
+        self.max_fill_days = max_fill_days
         self._rng = np.random.default_rng(seed)
         self.prices_: Optional[pd.DataFrame] = None
         self._common_factor: Optional[np.ndarray] = None  # factor de mercado compartido (lazy)
         self.synthetic_tickers_: List[str] = []  # tickers sin datos reales en el rango solicitado
+        self.raw_prices_: Dict[str, pd.Series] = {}  # series reales en su propio calendario
 
     # ------------------------------------------------------------------ #
     def fetch_prices(self) -> pd.DataFrame:
         """Descarga precios ajustados de cierre para todos los tickers."""
         frames: Dict[str, pd.Series] = {}
         self.synthetic_tickers_ = []
+        self.raw_prices_ = {}
         for tk in self.tickers:
             series = None
             if _YFINANCE_AVAILABLE:
@@ -331,11 +350,13 @@ class MarketDataPipeline:
                 logger.warning("Sin precio de mercado para %s: se genera serie sintética (GBM).", tk)
                 series = self._synthetic_price_series(tk)
                 self.synthetic_tickers_.append(tk)
+            else:
+                self.raw_prices_[tk] = series
 
             frames[tk] = series
 
         prices = pd.DataFrame(frames)
-        prices = prices.sort_index().ffill().dropna(how="all")
+        prices = prices.sort_index().ffill(limit=self.max_fill_days).dropna(how="all")
         prices = prices.loc[self.start : self.end]
         self.prices_ = prices
         return prices
@@ -390,6 +411,24 @@ class MarketDataPipeline:
         log_path = np.cumsum(drift + total_shocks)
         prices = s0 * np.exp(log_path)
         return pd.Series(prices, index=dates, name=ticker)
+
+    # ------------------------------------------------------------------ #
+    def liquidity_report(self) -> pd.DataFrame:
+        """
+        Indicadores de negociación de cada ticker con precio real, medidos en
+        su propio calendario (antes de alinear con el resto del universo, para
+        no contar como inactividad los festivos de otros mercados).
+        """
+        rows: Dict[str, Dict[str, object]] = {}
+        for tk, s in self.raw_prices_.items():
+            r = np.log(s / s.shift(1)).dropna()
+            rows[tk] = {
+                "pct_sin_movimiento": float((r.abs() < 1e-12).mean()) if len(r) else float("nan"),
+                "racha_precio_congelado": int(s.ne(s.shift(1)).cumsum().value_counts().max()),
+                "primer_dato": s.index[0],
+                "ultimo_dato": s.index[-1],
+            }
+        return pd.DataFrame.from_dict(rows, orient="index")
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -1471,7 +1510,10 @@ class PortfolioOptimizer:
         self.returns = returns.dropna(how="any")
         self.assets = list(self.returns.columns)
         self.n = len(self.assets)
-        self.rf = rf
+        self.rf = rf                          # tasa E.A. (decimal), tal como se recibe
+        # μ se estima sobre retornos log, así que el Sharpe se mide contra la
+        # rf en la misma escala: rf_log = ln(1 + rf_E.A.).
+        self.rf_log_ = float(np.log1p(rf))
         self.min_weight = min_weight
         self.trading_days = trading_days
         self.shrinkage = shrinkage
@@ -1641,7 +1683,7 @@ class PortfolioOptimizer:
         ret, vol = self._portfolio_perf(w)
         if vol == 0:
             return 0.0
-        return -(ret - self.rf) / vol
+        return -(ret - self.rf_log_) / vol
 
     def is_feasible(self, w: np.ndarray, tol: float = 1e-6) -> bool:
         """Verifica presupuesto, topes individuales y bandas por clase."""
@@ -1742,7 +1784,7 @@ class PortfolioOptimizer:
         for i in range(n_portfolios):
             w = self._random_feasible_weights(rng)
             ret, vol = self._portfolio_perf(w)
-            sharpe = (ret - self.rf) / vol if vol > 0 else 0.0
+            sharpe = (ret - self.rf_log_) / vol if vol > 0 else 0.0
             results[:, i] = [ret, vol, sharpe]
 
         fig = go.Figure()
@@ -1849,9 +1891,13 @@ class WalkForwardBacktester:
 
     # ------------------------------------------------------------------ #
     def _rebalance_dates(self) -> List[pd.Timestamp]:
-        dates = pd.date_range(self.returns.index[0], self.returns.index[-1], freq=self.rebalance_freq)
+        # Último día con dato de cada periodo: un fin de mes de calendario que cae
+        # en fin de semana o festivo no existe en el índice, y el slicing de
+        # run() descartaría el primer día hábil siguiente.
+        idx = self.returns.index
+        dates = pd.Series(idx, index=idx).resample(self.rebalance_freq).last().dropna()
         # Solo fechas con al menos `lookback_days` de historia disponible
-        valid = [d for d in dates if (self.returns.index <= d).sum() >= self.lookback_days]
+        valid = [pd.Timestamp(d) for d in dates if (idx <= d).sum() >= self.lookback_days]
         return valid
 
     # ------------------------------------------------------------------ #
@@ -1921,8 +1967,10 @@ class WalkForwardBacktester:
             next_date = rebal_dates[i + 1] if i + 1 < len(rebal_dates) else self.returns.index[-1]
             out_of_sample = self.returns.loc[reb_date:next_date].iloc[1:]  # excluye el día de rebalanceo
             if not out_of_sample.empty:
-                port_ret = out_of_sample[w.index] @ w.values
-                daily_portfolio_returns.append(port_ret)
+                # Los retornos log no son aditivos entre activos: se agrega en
+                # retornos simples y se vuelve a escala log para la serie.
+                simple_ret = np.expm1(out_of_sample[w.index]) @ w.values
+                daily_portfolio_returns.append(np.log1p(simple_ret))
 
         self.weights_history_ = pd.DataFrame(weight_records).T.fillna(0.0)
         self.rf_used_ = pd.Series(rf_records, name="rf")
@@ -2284,14 +2332,32 @@ def main() -> None:
     # EXCLUIR_ACTIVOS_SIN_PRECIO_REAL se descartan además los que sólo tienen
     # serie simulada: un activo inventado no debe competir por peso contra
     # activos con historia real (puede salir con un Sharpe alto por azar).
-    min_start_buffer = pd.Timestamp(start_date) + pd.Timedelta(days=45)
+    # También se exige dato hasta el final de la ventana (un título que dejó de
+    # cotizar queda con precio plano) y negociación suficiente (ver
+    # MAX_PCT_DIAS_SIN_MOVIMIENTO / MAX_DIAS_PRECIO_CONGELADO).
+    holgura = pd.Timedelta(days=HOLGURA_COBERTURA_DIAS)
+    min_start_buffer = pd.Timestamp(start_date) + holgura
+    max_end_buffer = pd.Timestamp(end_date) - holgura
+
+    liquidez = pipeline.liquidity_report()
+    motivos_exclusion: Dict[str, str] = {}
+    for tk in universe.all_tickers:
+        first, last = prices[tk].first_valid_index(), prices[tk].last_valid_index()
+        if first is None or first > min_start_buffer:
+            motivos_exclusion[tk] = "historia más corta que la ventana"
+        elif last < max_end_buffer:
+            motivos_exclusion[tk] = f"sin cotización desde {last.date()}"
+        elif tk in liquidez.index:
+            liq = liquidez.loc[tk]
+            if liq["pct_sin_movimiento"] > MAX_PCT_DIAS_SIN_MOVIMIENTO:
+                motivos_exclusion[tk] = (f"ilíquido: {liq['pct_sin_movimiento']:.0%} de días sin "
+                                         f"movimiento (máx. {MAX_PCT_DIAS_SIN_MOVIMIENTO:.0%})")
+            elif liq["racha_precio_congelado"] > MAX_DIAS_PRECIO_CONGELADO:
+                motivos_exclusion[tk] = (f"ilíquido: precio congelado {liq['racha_precio_congelado']} "
+                                         f"días seguidos (máx. {MAX_DIAS_PRECIO_CONGELADO})")
 
     def _con_historia(tickers: Sequence[str]) -> List[str]:
-        return [
-            tk for tk in tickers
-            if prices[tk].first_valid_index() is not None
-            and prices[tk].first_valid_index() <= min_start_buffer
-        ]
+        return [tk for tk in tickers if tk not in motivos_exclusion]
 
     rv_con_historia = _con_historia(universe.rv_tickers)
     rv_reales = [tk for tk in rv_con_historia if tk not in pipeline.synthetic_tickers_]
@@ -2321,11 +2387,12 @@ def main() -> None:
         (set(universe.rv_tickers) | set(universe.rf_etf_tickers))
         - set(rv_tickers) - set(rf_etf_tickers)
     )
+    for tk in descartados:
+        motivos_exclusion.setdefault(tk, "sin precio real observable (serie sintética)")
     if descartados:
         logger.warning(
-            "Excluidos del universo invertible (%s–%s) por no tener precio real completo: %s. "
-            "La RF sigue representada por los nodos TES (A) y los bonos filtrados (C).",
-            start_date, end_date, descartados,
+            "Excluidos del universo invertible (%s–%s): %s",
+            start_date, end_date, "; ".join(f"{tk} ({motivos_exclusion[tk]})" for tk in descartados),
         )
     if not rf_etf_tickers:
         logger.info("Sin ETFs/FICs de RF con precio observable: el Enfoque B queda vacío en esta corrida.")
@@ -2443,7 +2510,7 @@ def main() -> None:
     )
     logger.info(
         "Óptimo — retorno esp.: %.2f%% | vol: %.2f%% | Sharpe: %.4f | activos con peso > 0: %d",
-        ret_opt * 100, vol_opt * 100, (ret_opt - rf_tes) / vol_opt, int((weights_opt > 1e-4).sum()),
+        ret_opt * 100, vol_opt * 100, (ret_opt - optimizer.rf_log_) / vol_opt, int((weights_opt > 1e-4).sum()),
     )
 
     # ---------------------------------------------------------------- #
@@ -2506,8 +2573,9 @@ def main() -> None:
     if descartados:
         report.add_note(
             "<b>Integridad de datos.</b> Se excluyeron del universo invertible los siguientes "
-            f"activos por no tener precio real observable en el periodo: <b>{', '.join(descartados)}</b>. "
-            "El motor no sustituye precios faltantes por series simuladas dentro del optimizador."
+            "activos: " + "; ".join(f"<b>{tk}</b> ({motivos_exclusion[tk]})" for tk in descartados)
+            + ". El motor no sustituye precios faltantes por series simuladas dentro del optimizador, "
+            "ni admite títulos cuyo precio congelado haría parecer su riesgo menor al real."
         )
     report.add_chart("Curva TES — Estructura Temporal (ETTI)", curve.plot_curve())
     report.add_chart("Curva TES — Evolución por nodo", fi_engine.shocks.plot_curve_history())
@@ -2539,6 +2607,13 @@ def main() -> None:
     report.add_chart("Curva de Equity — Backtest Walk-Forward", backtester.plot_equity_curve())
     report.add_table("Desempeño fuera de muestra", pd.DataFrame(perf_summary, index=["valor"]).T)
     report.add_table("Métricas de riesgo micro por activo", risk_report)
+    if not liquidez.empty:
+        tabla_liquidez = liquidez.assign(
+            primer_dato=liquidez["primer_dato"].dt.date,
+            ultimo_dato=liquidez["ultimo_dato"].dt.date,
+            estado=[motivos_exclusion.get(tk, "incluido") for tk in liquidez.index],
+        ).sort_values("pct_sin_movimiento", ascending=False)
+        report.add_table("Liquidez y cobertura de precios por ticker", tabla_liquidez, "{:.3f}")
 
     report_path = report.write(os.path.join(DIRECTORIO_SALIDA, "reporte_interactivo.html"))
 
