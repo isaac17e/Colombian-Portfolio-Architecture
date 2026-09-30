@@ -106,6 +106,20 @@ CURVA_TES_TASAS: List[float] = [
 ]
 RUTA_CURVA_TES_CSV: Optional[str] = None   # p. ej. "datos/etti_banrep.csv"
 
+# Fuente del histórico diario de la curva:
+#   "banrep"   → tasas cero cupón TES en pesos a 1, 5 y 10 años publicadas por el
+#                Banco de la República (SUAMECA), completadas a todos los plazos
+#                con Nelson-Siegel. Si la descarga falla y no hay caché, se usa
+#                la curva simulada y se avisa en el log.
+#   "simulada" → curva fija CURVA_TES_* con choques del modelo de 3 factores.
+CURVA_TES_FUENTE: str = "banrep"
+# Escala de decaimiento de Nelson-Siegel (años) para completar la curva a partir
+# de los tres nodos publicados. Diebold y Li (2006): λ = 0.0609 mensual ≈ 1/1.37.
+CURVA_TES_TAU_NS: float = 1.37
+RUTA_CACHE_CURVA_TES: str = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "datos", "tes_cero_cupon_banrep.csv"
+)
+
 # Plazo de la curva usado como tasa libre de riesgo (debe reflejar el horizonte).
 RF_TENOR_YEARS: float = 1.0
 
@@ -136,6 +150,13 @@ BONOS_EMISORES_EXCLUIDOS: Set[str] = set()
 LOOKBACK_DIAS: int = 252
 FRECUENCIA_REBALANCEO: str = "ME"    # 'ME' fin de mes | 'W' semanal | 'QE' trimestral
 USAR_SHRINKAGE_LEDOIT_WOLF: bool = True
+# Estimador del retorno esperado de los activos sin μ analítico (RV y ETFs):
+#   "bayes_stein" → media muestral contraída hacia la media del portafolio de
+#                   mínima varianza de su clase, con intensidad estimada de los
+#                   datos (Jorion, 1986). Reduce el error de estimación que el
+#                   optimizador de Sharpe amplifica.
+#   "muestral"    → media muestral simple.
+ESTIMADOR_MU: str = "bayes_stein"
 
 # --- Política de datos --------------------------------------------------------
 # Con True, cualquier ticker sin precio real observable queda fuera del universo
@@ -614,6 +635,169 @@ class TESYieldCurve:
 
 
 # ==============================================================================
+# 2b. HISTÓRICO REAL DE LA CURVA TES (BANCO DE LA REPÚBLICA)
+# ==============================================================================
+
+class BanrepTESHistory:
+    """
+    Histórico diario de las tasas cero cupón de los TES en pesos a 1, 5 y 10
+    años que publica el Banco de la República en su portal SUAMECA (extraídas
+    de su curva Nelson-Siegel estimada con operaciones del SEN y el MEC).
+
+    Guarda una copia local en `cache_path`: se reutiliza si cubre la ventana
+    pedida, y sirve de respaldo si la descarga falla.
+    """
+
+    URL = ("https://suameca.banrep.gov.co/estadisticas-economicas-back/rest/"
+           "estadisticaEconomicaRestService/consultaInformacionSerie")
+    SERIES: Dict[float, int] = {1.0: 15272, 5.0: 15273, 10.0: 15274}   # TES pesos
+    _HEADERS = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json",
+        "Referer": "https://suameca.banrep.gov.co/estadisticas-economicas/",
+        "Origin": "https://suameca.banrep.gov.co",
+    }
+
+    def __init__(self, cache_path: Optional[str] = None, timeout: float = 60.0) -> None:
+        self.cache_path = cache_path
+        self.timeout = timeout
+
+    # ------------------------------------------------------------------ #
+    def fetch(self, start: Union[str, pd.Timestamp], end: Union[str, pd.Timestamp]) -> pd.DataFrame:
+        """
+        Tasas E.A. en decimal (índice = fechas hábiles, columnas = plazos en
+        años) para la ventana [start, end].
+        """
+        start, end = pd.Timestamp(start), pd.Timestamp(end)
+        cached = self._read_cache()
+        # Holgura de una semana para fines de semana y festivos en los bordes.
+        slack = pd.Timedelta(days=7)
+        if cached is not None and cached.index[0] <= start + slack and cached.index[-1] >= end - slack:
+            logger.info("Curva TES histórica leída de la caché %s.", self.cache_path)
+            return cached.loc[start:end]
+        try:
+            data = self._download()
+        except Exception as exc:
+            if cached is None:
+                raise
+            logger.warning("Descarga de la curva TES falló (%s); se usa la caché %s aunque no "
+                           "cubra toda la ventana.", exc, self.cache_path)
+            return cached.loc[start:end]
+        self._write_cache(data)
+        logger.info("Curva TES histórica descargada de Banrep: %d días (%s a %s).",
+                    len(data), data.index[0].date(), data.index[-1].date())
+        return data.loc[start:end]
+
+    # ------------------------------------------------------------------ #
+    def _download(self) -> pd.DataFrame:
+        import json
+
+        cols: Dict[float, pd.Series] = {}
+        for tenor, series_id in self.SERIES.items():
+            payload = json.loads(self._get(f"{self.URL}?idSerie={series_id}").decode("utf-8"))
+            if not payload or not payload[0].get("data"):
+                raise ValueError(f"Serie {series_id} vacía en SUAMECA.")
+            # Marcas de tiempo en milisegundos a medianoche de Bogotá.
+            ms, values = zip(*payload[0]["data"])
+            idx = (pd.to_datetime(list(ms), unit="ms", utc=True)
+                   .tz_convert("America/Bogota").normalize().tz_localize(None))
+            cols[tenor] = pd.Series(np.asarray(values, dtype=float) / 100.0, index=idx)
+        return pd.DataFrame(cols).sort_index().dropna(how="any")
+
+    # ------------------------------------------------------------------ #
+    def _get(self, url: str) -> bytes:
+        """
+        GET con verificación TLS completa. El servidor de SUAMECA no envía el
+        certificado intermedio de su cadena (los navegadores lo completan solos
+        vía AIA; Python no). Si la verificación falla por eso, se descarga el
+        intermedio desde la URL que declara el propio certificado y se reintenta
+        exigiendo que la cadena termine en una raíz de confianza.
+        """
+        import ssl
+        import urllib.error
+        import urllib.request
+
+        req = urllib.request.Request(url, headers=self._HEADERS)
+        context = self._base_ssl_context()
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=context) as resp:
+                return resp.read()
+        except urllib.error.URLError as exc:
+            if not isinstance(exc.reason, ssl.SSLCertVerificationError):
+                raise
+        host = urllib.request.urlparse(url).hostname
+        context = self._context_with_intermediate(host)
+        with urllib.request.urlopen(req, timeout=self.timeout, context=context) as resp:
+            return resp.read()
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _base_ssl_context() -> "ssl.SSLContext":
+        import ssl
+
+        # Algunas instalaciones de Python (p. ej. Homebrew en macOS) no traen
+        # certificados raíz; certifi (dependencia de yfinance) los provee.
+        try:
+            import certifi
+            return ssl.create_default_context(cafile=certifi.where())
+        except ImportError:
+            return ssl.create_default_context()
+
+    # ------------------------------------------------------------------ #
+    def _context_with_intermediate(self, host: str) -> "ssl.SSLContext":
+        import re
+        import ssl
+        import urllib.request
+
+        # El certificado del servidor se lee sin verificar sólo para extraer la
+        # URL 'CA Issuers' (texto ASCII dentro del DER); no se confía en él.
+        leaf_der = ssl.PEM_cert_to_DER_cert(ssl.get_server_certificate((host, 443), timeout=self.timeout))
+        urls = re.findall(rb"http://[\x21-\x7e]+?\.(?:crt|cer|der)", leaf_der)
+        if not urls:
+            raise ssl.SSLError(f"{host}: cadena TLS incompleta y sin URL del emisor (AIA).")
+
+        context = self._base_ssl_context()
+        # Sin PARTIAL_CHAIN (activo por defecto desde Python 3.13), el intermedio
+        # sólo sirve para construir la cadena: ésta debe terminar en una raíz de
+        # confianza, así que un intermedio adulterado no valida nada.
+        context.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
+        for url in urls:
+            with urllib.request.urlopen(url.decode("ascii"), timeout=self.timeout) as resp:
+                cert = resp.read()
+            pem = cert.decode("ascii") if cert.startswith(b"-----BEGIN") else ssl.DER_cert_to_PEM_cert(cert)
+            context.load_verify_locations(cadata=pem)
+        return context
+
+    # ------------------------------------------------------------------ #
+    def _read_cache(self) -> Optional[pd.DataFrame]:
+        if not self.cache_path or not os.path.exists(self.cache_path):
+            return None
+        df = pd.read_csv(self.cache_path, index_col=0, parse_dates=True)
+        df.columns = [float(c) for c in df.columns]
+        return df.sort_index() if not df.empty else None
+
+    def _write_cache(self, data: pd.DataFrame) -> None:
+        if not self.cache_path:
+            return
+        os.makedirs(os.path.dirname(self.cache_path), exist_ok=True)
+        data.to_csv(self.cache_path, index_label="fecha")
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def complete_curve(nodes: pd.DataFrame, tenors: Sequence[float], tau: float) -> pd.DataFrame:
+        """
+        Completa la curva a todos los `tenors` ajustando cada día un
+        Nelson-Siegel con `tau` fijo: con tres nodos publicados (1, 5, 10 años)
+        los tres β quedan determinados exactamente, y la curva resultante pasa
+        por los nodos y extrapola de forma acotada fuera de ellos.
+        """
+        node_t = np.asarray(nodes.columns, dtype=float)
+        betas = np.linalg.solve(nelson_siegel_loadings(node_t, tau), nodes.to_numpy().T).T
+        levels = betas @ nelson_siegel_loadings(tenors, tau).T
+        return pd.DataFrame(levels, index=nodes.index, columns=[float(t) for t in tenors])
+
+
+# ==============================================================================
 # 3. ANALÍTICA DE RENTA FIJA (precio, YTM, duración, convexidad)
 # ==============================================================================
 
@@ -694,6 +878,15 @@ class BondAnalytics:
 # 4. SIMULADOR DE CHOQUES DE CURVA (motor común de los Enfoques A y C)
 # ==============================================================================
 
+def nelson_siegel_loadings(tenors: Sequence[float], tau: float) -> np.ndarray:
+    """Matriz (n_plazos x 3) de cargas Nelson-Siegel: nivel, pendiente, curvatura."""
+    t = np.maximum(np.asarray(tenors, dtype=float), 1e-6) / tau
+    l1 = np.ones_like(t)
+    l2 = (1.0 - np.exp(-t)) / t
+    l3 = l2 - np.exp(-t)
+    return np.column_stack([l1, l2, l3])
+
+
 @dataclass
 class CurveShockConfig:
     """
@@ -738,15 +931,12 @@ class CurveShockGenerator:
         self.config = config or CurveShockConfig()
         self.levels_: Optional[pd.DataFrame] = None
         self.changes_: Optional[pd.DataFrame] = None
+        self.source_: Optional[str] = None   # "simulada" | "histórica"
 
     # ------------------------------------------------------------------ #
     def _nelson_siegel_loadings(self) -> np.ndarray:
         """Matriz (n_tenors x 3) de cargas factoriales nivel/pendiente/curvatura."""
-        t = np.maximum(self.tenors, 1e-6) / self.config.tau
-        l1 = np.ones_like(t)
-        l2 = (1.0 - np.exp(-t)) / t
-        l3 = l2 - np.exp(-t)
-        return np.column_stack([l1, l2, l3])
+        return nelson_siegel_loadings(self.tenors, self.config.tau)
 
     # ------------------------------------------------------------------ #
     def simulate(
@@ -785,6 +975,7 @@ class CurveShockGenerator:
         levels_df = pd.DataFrame(levels, index=dates, columns=self.tenors)
         self.levels_ = levels_df
         self.changes_ = levels_df.diff().fillna(0.0)
+        self.source_ = "simulada"
         return levels_df
 
     # ------------------------------------------------------------------ #
@@ -802,6 +993,7 @@ class CurveShockGenerator:
         levels_df = pd.DataFrame(interp, index=hist.index, columns=self.tenors)
         self.levels_ = levels_df
         self.changes_ = levels_df.diff().fillna(0.0)
+        self.source_ = "histórica"
         return levels_df
 
     # ------------------------------------------------------------------ #
@@ -809,16 +1001,29 @@ class CurveShockGenerator:
         """Interpola las variaciones diarias Δy a plazos arbitrarios."""
         if self.changes_ is None:
             raise RuntimeError("Ejecute simulate() o from_history() primero.")
+        return self._interp_columns(self.changes_, maturities)
+
+    # ------------------------------------------------------------------ #
+    def levels_at(self, maturities: Sequence[float]) -> pd.DataFrame:
+        """Interpola los niveles diarios de la curva a plazos arbitrarios."""
+        if self.levels_ is None:
+            raise RuntimeError("Ejecute simulate() o from_history() primero.")
+        return self._interp_columns(self.levels_, maturities)
+
+    # ------------------------------------------------------------------ #
+    def _interp_columns(self, frame: pd.DataFrame, maturities: Sequence[float]) -> pd.DataFrame:
+        """
+        Interpolación lineal por columnas: equivale a np.interp fila a fila,
+        con extrapolación plana en los extremos, pero vectorizada.
+        """
         mats = np.asarray(maturities, dtype=float)
-        # Interpolación lineal por columnas (equivale a np.interp fila a fila,
-        # con extrapolación plana en los extremos, pero vectorizada).
         t = self.tenors
         m = np.clip(mats, t[0], t[-1])
         j = np.clip(np.searchsorted(t, m, side="right") - 1, 0, len(t) - 2)
         w = (m - t[j]) / (t[j + 1] - t[j])
-        c = self.changes_.to_numpy()
+        c = frame.to_numpy()
         vals = c[:, j] * (1.0 - w) + c[:, j + 1] * w
-        return pd.DataFrame(vals, index=self.changes_.index, columns=mats)
+        return pd.DataFrame(vals, index=frame.index, columns=mats)
 
     # ------------------------------------------------------------------ #
     def curve_at(self, date: pd.Timestamp) -> TESYieldCurve:
@@ -842,7 +1047,8 @@ class CurveShockGenerator:
                 mode="lines", name=f"{tenor:g}A", line=dict(width=1.8),
             ))
         fig.update_layout(
-            title="Evolución simulada de la curva TES por nodo de plazo",
+            title=(f"Evolución {'histórica (Banrep)' if self.source_ == 'histórica' else 'simulada'} "
+                   "de la curva TES por nodo de plazo"),
             xaxis_title="Fecha", yaxis_title="Tasa cero cupón (% E.A.)",
         )
         return fig
@@ -921,19 +1127,61 @@ class TESNodeBuilder:
         self, shocks: CurveShockGenerator, specs: Optional[Sequence[AssetSpec]] = None
     ) -> pd.DataFrame:
         """
-        Retornos simples diarios de cada nodo:
-            r_t = carry_diario + (−D_mod·Δy_t + ½·C·(Δy_t)²)
+        Retornos simples diarios de cada nodo, como un bono par de plazo
+        constante que se renueva a diario:
+
+            r_t = carry_t + roll-down_t − D_{t−1}·Δc_t + ½·C_{t−1}·(Δc_t)²
+
+        donde c_t es el cupón par de la curva del día al plazo del nodo. El
+        carry, la duración y la convexidad se toman de la curva del día
+        anterior: con tasas que se mueven de 2% a 13% (2021-2022), fijarlos en
+        la curva inicial distorsionaría el retorno.
         """
         node_specs = list(specs or self.build_specs())
-        dy = shocks.changes_at([float(s.metadata["plazo_anios"]) for s in node_specs])
+        idx = shocks.levels_.index
+        d_tau = np.diff(np.asarray((idx - idx[0]).days, dtype=float) / 365.25, prepend=0.0)
         out: Dict[str, pd.Series] = {}
-        for spec, col in zip(node_specs, dy.columns):
-            carry_daily = (1.0 + float(spec.ytm)) ** (1.0 / TRADING_DAYS) - 1.0
-            price_ret = BondAnalytics.price_return(
-                dy[col].values, float(spec.modified_duration), float(spec.convexity)
-            )
-            out[spec.ticker] = pd.Series(carry_daily + price_ret, index=dy.index)
+        for spec in node_specs:
+            tenor = float(spec.metadata["plazo_anios"])
+            par = self._par_yield_history(shocks, tenor)
+            dmod, conv = self._par_bond_risk(par, tenor)
+            prev = lambda x: np.concatenate([[x[0]], x[:-1]])
+            par_prev, dmod_prev, conv_prev = prev(par), prev(dmod), prev(conv)
+
+            dc = np.diff(par, prepend=par[0])
+            carry = (1.0 + par_prev) ** d_tau - 1.0
+            rolldown = np.zeros_like(par)
+            if self.include_rolldown and tenor > 1.0:
+                slope = par - self._par_yield_history(shocks, tenor - 1.0)   # por año de plazo
+                rolldown = dmod_prev * prev(slope) * d_tau
+            price_ret = -dmod_prev * dc + 0.5 * conv_prev * dc ** 2
+            out[spec.ticker] = pd.Series(carry + rolldown + price_ret, index=idx)
         return pd.DataFrame(out)
+
+    # ------------------------------------------------------------------ #
+    def _par_yield_history(self, shocks: CurveShockGenerator, tenor: float) -> np.ndarray:
+        """Cupón par diario al plazo `tenor`: (1 − DF_T) / Σ DF_i / freq."""
+        f = self.coupon_freq
+        n = max(int(round(tenor * f)), 1)
+        times = np.arange(1, n + 1, dtype=float) / f
+        zeros = shocks.levels_at(times).to_numpy()            # (fechas x pagos)
+        dfs = (1.0 + zeros) ** (-times[None, :])
+        return (1.0 - dfs[:, -1]) / (dfs.sum(axis=1) / f)
+
+    # ------------------------------------------------------------------ #
+    def _par_bond_risk(self, par: np.ndarray, tenor: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Duración modificada y convexidad de un bono par (cupón = tasa) por fecha."""
+        f = self.coupon_freq
+        n = max(int(round(tenor * f)), 1)
+        times = np.arange(1, n + 1, dtype=float) / f
+        y = par[:, None]
+        cfs = np.repeat(y / f, n, axis=1)
+        cfs[:, -1] += 1.0
+        pv = cfs * (1.0 + y) ** (-times[None, :])
+        price = pv.sum(axis=1)
+        dmod = (pv * times).sum(axis=1) / price / (1.0 + par)
+        conv = (pv * times * (times + 1.0)).sum(axis=1) / (price * (1.0 + par) ** 2)
+        return dmod, conv
 
 
 # ==============================================================================
@@ -957,9 +1205,10 @@ class BondSpec:
     """
     Características de un bono individual del mercado local.
 
-    `ytm` y `price` son alternativos: si sólo se conoce el precio, la YTM se
-    deriva por Brent; si sólo se conoce la tasa, el precio se calcula
-    descontando los flujos.
+    `ytm`, `price` y `spread_bp` son alternativos (en ese orden de prioridad):
+    si sólo se conoce el precio, la YTM se deriva por Brent; si sólo se conoce
+    la tasa, el precio se calcula descontando los flujos; si sólo se conoce el
+    spread, la YTM es la curva TES al plazo residual más el spread.
     """
 
     isin: str
@@ -969,6 +1218,7 @@ class BondSpec:
     maturity_date: Union[str, datetime]
     ytm: Optional[float] = None           # tasa de negociación E.A. (decimal)
     price: Optional[float] = None         # precio sucio por 100 de nominal
+    spread_bp: Optional[float] = None     # spread sobre la curva TES (pb)
     freq: int = 1
     face: float = 100.0
     indexacion: str = "TF"                # TF | IPC | UVR | IBR
@@ -1033,6 +1283,11 @@ class BondScreener:
         lo que entregaría un proveedor de precios (PiP / Precia) o una mesa de
         distribución. Sustituible por la lista real de ISINs sin cambiar el
         resto del pipeline.
+
+        Los títulos en pesos se definen por su spread sobre la curva TES, de
+        modo que su YTM sea coherente con la curva cargada (histórica o
+        simulada). El TES UVR conserva su tasa real, que no es comparable con
+        la curva en pesos.
         """
         base = pd.Timestamp(as_of)
 
@@ -1041,29 +1296,29 @@ class BondScreener:
 
         return [
             BondSpec("COL17CT02622", "Ministerio de Hacienda (TES)", "AAA", 0.0700, mat(3.5),
-                     ytm=0.0940, freq=1, indexacion="TF", liquidez=0.95, sector="Soberano"),
+                     spread_bp=3, freq=1, indexacion="TF", liquidez=0.95, sector="Soberano"),
             BondSpec("COL17CT03000", "Ministerio de Hacienda (TES)", "AAA", 0.0725, mat(7.2),
-                     ytm=0.0980, freq=1, indexacion="TF", liquidez=0.92, sector="Soberano"),
+                     spread_bp=3, freq=1, indexacion="TF", liquidez=0.92, sector="Soberano"),
             BondSpec("COL17CT03109", "Ministerio de Hacienda (TES UVR)", "AAA", 0.0325, mat(9.0),
                      ytm=0.0365, freq=1, indexacion="UVR", liquidez=0.70, sector="Soberano"),
             BondSpec("COB07CB00123", "Bancolombia", "AAA", 0.0810, mat(4.0),
-                     ytm=0.1015, freq=2, indexacion="TF", liquidez=0.62, sector="Financiero"),
+                     spread_bp=73, freq=2, indexacion="TF", liquidez=0.62, sector="Financiero"),
             BondSpec("COB07CB00456", "Banco de Bogotá", "AAA", 0.0790, mat(2.5),
-                     ytm=0.1005, freq=2, indexacion="TF", liquidez=0.58, sector="Financiero"),
+                     spread_bp=68, freq=2, indexacion="TF", liquidez=0.58, sector="Financiero"),
             BondSpec("COE12CB00777", "Empresas Públicas de Medellín", "AA+", 0.0865, mat(6.0),
-                     ytm=0.1070, freq=1, indexacion="TF", liquidez=0.48, sector="Utilities"),
+                     spread_bp=104, freq=1, indexacion="TF", liquidez=0.48, sector="Utilities"),
             BondSpec("COI15CB00321", "Interconexión Eléctrica (ISA)", "AAA", 0.0840, mat(8.5),
-                     ytm=0.1055, freq=1, indexacion="TF", liquidez=0.52, sector="Utilities"),
+                     spread_bp=69, freq=1, indexacion="TF", liquidez=0.52, sector="Utilities"),
             BondSpec("COG21CB00654", "Grupo Argos", "AA", 0.0925, mat(5.0),
-                     ytm=0.1140, freq=1, indexacion="TF", liquidez=0.30, sector="Holding"),
+                     spread_bp=185, freq=1, indexacion="TF", liquidez=0.30, sector="Holding"),
             BondSpec("COD09CB00888", "Davivienda", "AA+", 0.0880, mat(12.0),
-                     ytm=0.1120, freq=2, indexacion="TF", liquidez=0.44, sector="Financiero"),
+                     spread_bp=117, freq=2, indexacion="TF", liquidez=0.44, sector="Financiero"),
             BondSpec("COT31CB00999", "Titularizadora Colombiana", "AA-", 0.0950, mat(6.5),
-                     ytm=0.1215, freq=1, indexacion="TF", liquidez=0.22, sector="Titularizado"),
+                     spread_bp=244, freq=1, indexacion="TF", liquidez=0.22, sector="Titularizado"),
             BondSpec("COA44CB00111", "Avianca", "BBB", 0.1150, mat(4.5),
-                     ytm=0.1520, freq=2, indexacion="TF", liquidez=0.18, sector="Transporte"),
+                     spread_bp=572, freq=2, indexacion="TF", liquidez=0.18, sector="Transporte"),
             BondSpec("COC55CB00222", "Celsia", "AA+", 0.0895, mat(0.6),
-                     ytm=0.0985, freq=1, indexacion="TF", liquidez=0.40, sector="Utilities"),
+                     spread_bp=24, freq=1, indexacion="TF", liquidez=0.40, sector="Utilities"),
         ]
 
     # ------------------------------------------------------------------ #
@@ -1079,8 +1334,11 @@ class BondScreener:
         elif bond.price is not None:
             price = float(bond.price)
             ytm = BondAnalytics.ytm_from_price(times, cfs, price)
+        elif bond.spread_bp is not None:
+            ytm = float(self.curve.get_rate(ttm)) + float(bond.spread_bp) / 1e4
+            price = BondAnalytics.price_from_ytm(times, cfs, ytm)
         else:
-            raise ValueError(f"El bono {bond.isin} debe traer 'ytm' o 'price'.")
+            raise ValueError(f"El bono {bond.isin} debe traer 'ytm', 'price' o 'spread_bp'.")
 
         _, dmod, conv = BondAnalytics.duration_convexity(times, cfs, ytm)
         spread_bp = (ytm - float(self.curve.get_rate(ttm))) * 1e4
@@ -1484,7 +1742,11 @@ class FixedIncomeEngine:
         en lugar del simulador de choques.
         """
         if curve_history is not None:
-            self.shocks.from_history(curve_history)
+            # El histórico viene en días hábiles de Colombia; se lleva al
+            # calendario del resto del universo arrastrando el último dato.
+            hist = curve_history.sort_index()
+            hist = hist.reindex(hist.index.union(pd.DatetimeIndex(dates))).ffill().bfill()
+            self.shocks.from_history(hist.reindex(pd.DatetimeIndex(dates)))
         else:
             self.shocks.simulate(pd.DatetimeIndex(dates), market_returns)
 
@@ -1747,9 +2009,13 @@ class PortfolioOptimizer:
         asset_groups: Optional[Mapping[str, str]] = None,
         group_constraints: Optional[Sequence[GroupConstraint]] = None,
         expected_returns: Optional[Union[pd.Series, Mapping[str, float]]] = None,
+        mu_estimator: Optional[str] = None,
     ) -> None:
         if returns.empty:
             raise ValueError("La matriz de retornos no puede estar vacía.")
+        self.mu_estimator = mu_estimator or ESTIMADOR_MU
+        if self.mu_estimator not in ("bayes_stein", "muestral"):
+            raise ValueError(f"mu_estimator debe ser 'bayes_stein' o 'muestral', no '{self.mu_estimator}'.")
         self.returns = returns.dropna(how="any")
         self.assets = list(self.returns.columns)
         self.n = len(self.assets)
@@ -1777,19 +2043,62 @@ class PortfolioOptimizer:
         self._validate_feasibility()
 
         # --- momentos ---
-        self.mu_ = self.returns.mean().values * trading_days
-        if expected_returns is not None:
-            override = pd.Series(expected_returns, dtype=float)
-            mu_series = pd.Series(self.mu_, index=self.assets)
-            mu_series.update(override.reindex(mu_series.index).dropna())
-            self.mu_ = mu_series.values
-        self.mu_series_ = pd.Series(self.mu_, index=self.assets, name="mu")
-
         self.cov_, self.shrinkage_intensity_ = MarketDataPipeline.covariance_matrix(
             self.returns, shrinkage=shrinkage, trading_days=trading_days
         )
         self.cov_df_ = pd.DataFrame(self.cov_, index=self.assets, columns=self.assets)
+
+        override = (pd.Series(expected_returns, dtype=float).reindex(self.assets).dropna()
+                    if expected_returns is not None else pd.Series(dtype=float))
+        self.mu_sample_series_ = pd.Series(self.returns.mean().values * trading_days,
+                                           index=self.assets, name="mu_muestral")
+        mu_series = self.mu_sample_series_.copy()
+        self.mu_shrinkage_: Dict[str, float] = {}   # intensidad φ de Bayes-Stein por clase
+        if self.mu_estimator == "bayes_stein":
+            mu_series = self._bayes_stein(mu_series, exclude=set(override.index))
+        mu_series.update(override)
+        self.mu_ = mu_series.values
+        self.mu_series_ = pd.Series(self.mu_, index=self.assets, name="mu")
         self.result_: Optional[optimize.OptimizeResult] = None
+
+    # ------------------------------------------------------------------ #
+    def _bayes_stein(self, mu: pd.Series, exclude: Set[str]) -> pd.Series:
+        """
+        Estimador de Bayes-Stein (Jorion, 1986) para los activos cuyo μ sale de
+        la media muestral. Dentro de cada clase de activo contrae las medias
+        hacia la media del portafolio de mínima varianza de esa clase:
+
+            μ_BS = (1 − φ)·μ̂ + φ·μ₀·1
+            μ₀   = 1'Σ⁻¹μ̂ / 1'Σ⁻¹1
+            φ    = (N + 2) / [(N + 2) + T·(μ̂ − μ₀1)'Σ⁻¹(μ̂ − μ₀1)]
+
+        con Σ = covarianza diaria·(T − 1)/(T − N − 2). Con una ventana corta
+        (T pequeño) las diferencias entre medias muestrales son casi todo ruido
+        y φ se acerca a 1; con más historia pesan más los datos. Se usa la
+        covarianza del optimizador (Ledoit-Wolf si está activo) por estabilidad
+        numérica.
+        """
+        out = mu.copy()
+        T = len(self.returns)
+        cov_daily = self.cov_ / self.trading_days
+        groups: Dict[str, List[int]] = {}
+        for i, a in enumerate(self.assets):
+            if a not in exclude:
+                groups.setdefault(self.asset_groups.get(a, "SIN_CLASE"), []).append(i)
+        for label, idx in groups.items():
+            n = len(idx)
+            if n < 3 or T <= n + 2:
+                continue
+            sigma = cov_daily[np.ix_(idx, idx)] * (T - 1) / (T - n - 2)
+            inv = np.linalg.pinv(sigma)
+            ones = np.ones(n)
+            m = mu.iloc[idx].to_numpy() / self.trading_days
+            mu0 = float(ones @ inv @ m / (ones @ inv @ ones))
+            d = m - mu0
+            phi = float(np.clip((n + 2) / ((n + 2) + T * float(d @ inv @ d)), 0.0, 1.0))
+            out.iloc[idx] = ((1.0 - phi) * m + phi * mu0) * self.trading_days
+            self.mu_shrinkage_[label] = phi
+        return out
 
     # ------------------------------------------------------------------ #
     # RESTRICCIONES DE GRUPO
@@ -2142,6 +2451,7 @@ class WalkForwardBacktester:
         self.equity_curve_: Optional[pd.Series] = None
         self.rf_used_: Optional[pd.Series] = None
         self.excluded_history_: Dict[pd.Timestamp, Set[str]] = {}
+        self.mu_shrinkage_history_: Dict[pd.Timestamp, Dict[str, float]] = {}
 
     # ------------------------------------------------------------------ #
     def _rebalance_dates(self) -> List[pd.Timestamp]:
@@ -2187,6 +2497,7 @@ class WalkForwardBacktester:
         self, window_returns: pd.DataFrame, reb_date: pd.Timestamp
     ) -> Tuple[pd.Series, float]:
         opt = self._build_optimizer(window_returns, reb_date)
+        self.mu_shrinkage_history_[reb_date] = dict(opt.mu_shrinkage_)
         return opt.max_sharpe(), opt.rf
 
     # ------------------------------------------------------------------ #
@@ -2215,6 +2526,7 @@ class WalkForwardBacktester:
         daily_portfolio_returns: List[pd.Series] = []
 
         self.excluded_history_ = {}
+        self.mu_shrinkage_history_ = {}
         for i, reb_date in enumerate(rebal_dates):
             in_sample = self._in_sample(reb_date)
             try:
@@ -2273,6 +2585,10 @@ class WalkForwardBacktester:
         if self.class_weights_history_ is not None:
             for cls_label, serie in self.class_weights_history_.items():
                 summary[f"peso_medio_{cls_label}"] = float(serie.mean())
+        if self.mu_shrinkage_history_:
+            phi = pd.DataFrame(self.mu_shrinkage_history_).T
+            for cls_label, serie in phi.items():
+                summary[f"shrinkage_mu_medio_{cls_label}"] = float(serie.mean())
         return summary
 
     # ------------------------------------------------------------------ #
@@ -2666,16 +2982,34 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     logger.info("-" * 78)
     logger.info("CURVA TES — TASA LIBRE DE RIESGO Y NODOS DE DURACIÓN")
-    curve = TESYieldCurve.from_config()
+    # Histórico real de la curva (Banrep) completado a todos los plazos con
+    # Nelson-Siegel. La curva base —con la que se hace el screening inicial y
+    # se definen los nodos— es la vigente al inicio de la ventana.
+    curve_history: Optional[pd.DataFrame] = None
+    plazos_curva = sorted(set(float(t) for t in CURVA_TES_PLAZOS) | set(float(t) for t in universe.nodos_tes))
+    if CURVA_TES_FUENTE == "banrep":
+        try:
+            nodos_banrep = BanrepTESHistory(RUTA_CACHE_CURVA_TES).fetch(
+                pd.Timestamp(start_date) - pd.Timedelta(days=15), end_date
+            )
+            curve_history = BanrepTESHistory.complete_curve(nodos_banrep, plazos_curva, CURVA_TES_TAU_NS)
+        except Exception as exc:
+            logger.warning(
+                "No se pudo obtener la curva TES histórica de Banrep (%s). Se usa la curva simulada: "
+                "los resultados de renta fija no reflejan el mercado.", exc,
+            )
+    elif CURVA_TES_FUENTE != "simulada":
+        raise ValueError(f"CURVA_TES_FUENTE debe ser 'banrep' o 'simulada', no '{CURVA_TES_FUENTE}'.")
 
-    # La tasa libre de riesgo se lee de la curva TES al plazo del horizonte de
-    # inversión, en vez de fijarse a dedo: la curva colombiana no es plana y
-    # `rf` entra directamente en el Sharpe que optimizamos.
-    rf_tes = float(curve.get_rate(policy.rf_tenor_years))
-    logger.info(
-        "Tasa libre de riesgo: TES a %.2g año(s) = %.4f%% E.A. (curva cero cupón interpolada)",
-        policy.rf_tenor_years, rf_tes * 100,
-    )
+    if curve_history is not None:
+        fila_inicio = curve_history.loc[:start_date]
+        fila_inicio = fila_inicio.iloc[-1] if not fila_inicio.empty else curve_history.iloc[0]
+        curve = TESYieldCurve.from_levels(plazos_curva, fila_inicio.values)
+        logger.info("Curva TES: histórico real de Banrep (1, 5 y 10 años, completado con Nelson-Siegel "
+                    "τ=%.2f), %d días.", CURVA_TES_TAU_NS, len(curve_history))
+    else:
+        curve = TESYieldCurve.from_config()
+        logger.info("Curva TES: curva fija de configuración con choques simulados.")
 
     # ---------------------------------------------------------------- #
     # 3) MOTOR DE RENTA FIJA — ENFOQUES A + B + C
@@ -2692,6 +3026,20 @@ def main() -> None:
     fi_bundle = fi_engine.build(
         dates=prices.index,
         market_returns=returns[universe.benchmark],
+        curve_history=curve_history,
+    )
+
+    # La tasa libre de riesgo se lee de la curva TES al plazo del horizonte de
+    # inversión, en vez de fijarse a dedo: la curva colombiana no es plana y
+    # `rf` entra directamente en el Sharpe que optimizamos. Con curva histórica
+    # varía en el tiempo: el portafolio estratégico usa la del cierre y las
+    # métricas históricas por activo, el promedio de la ventana.
+    rf_serie = fi_engine.shocks.levels_at([policy.rf_tenor_years]).iloc[:, 0]
+    rf_tes = float(rf_serie.iloc[-1])
+    rf_medio = float(rf_serie.mean())
+    logger.info(
+        "Tasa libre de riesgo: TES a %.2g año(s) = %.4f%% E.A. al cierre (%.4f%% al inicio, "
+        "%.4f%% en promedio)", policy.rf_tenor_years, rf_tes * 100, rf_serie.iloc[0] * 100, rf_medio * 100,
     )
     print("\n--- Screening de bonos individuales (Enfoque C) ---")
     print(fi_bundle.screening_report[
@@ -2728,7 +3076,7 @@ def main() -> None:
     risk_report = RiskMetrics.asset_risk_report(
         pd.concat([prices, fi_bundle.prices], axis=1, sort=True).ffill(),
         pd.concat([multi_returns, returns[[universe.benchmark]]], axis=1, sort=True).dropna(how="any"),
-        universe.benchmark, rf_tes, specs,
+        universe.benchmark, rf_medio, specs,
     )
     print("\n" + risk_report.round(4).to_string())
 
@@ -2784,6 +3132,9 @@ def main() -> None:
         "Intensidad de shrinkage Ledoit-Wolf: δ = %.4f (0 = covarianza muestral pura, 1 = target)",
         optimizer.shrinkage_intensity_,
     )
+    for clase, phi in optimizer.mu_shrinkage_.items():
+        logger.info("Bayes-Stein sobre μ de %s: φ = %.3f (0 = media muestral, 1 = media común).",
+                    clase, phi)
     logger.info(
         "Óptimo — retorno esp.: %.2f%% | vol: %.2f%% | Sharpe: %.4f | activos con peso > 0: %d",
         ret_opt * 100, vol_opt * 100, (ret_opt - optimizer.rf_log_) / vol_opt, int((weights_opt > 1e-4).sum()),
@@ -2859,6 +3210,16 @@ def main() -> None:
               "<b>(B)</b> sin ETFs/FICs en esta corrida — ningún vehículo del universo tiene "
               "precio observable en la fuente de datos")
     report.add_note(
+        "<b>Curva TES.</b> "
+        + ("Histórico diario real de las tasas cero cupón TES en pesos a 1, 5 y 10 años del Banco "
+           "de la República (SUAMECA), completado a todos los plazos con Nelson-Siegel "
+           f"(τ = {CURVA_TES_TAU_NS:g} años). Los spreads de crédito de los bonos siguen siendo "
+           "simulados: no hay una fuente pública de precios históricos por título."
+           if fi_engine.shocks.source_ == "histórica" else
+           "<b>Simulada</b> alrededor de una curva fija de configuración: los resultados de renta "
+           "fija no reflejan episodios reales del mercado.")
+    )
+    report.add_note(
         "<b>Arquitectura de Renta Fija.</b> La pata de RF combina tres vías: "
         f"<b>(A)</b> {n_nodos} nodos sintéticos de la curva TES, cuyo retorno diario se modela por "
         "duración modificada y convexidad — ΔP/P ≈ −D·Δy + ½·C·(Δy)²; "
@@ -2877,7 +3238,9 @@ def main() -> None:
             + ". El motor no sustituye precios faltantes por series simuladas dentro del optimizador, "
             "ni admite títulos cuyo precio congelado haría parecer su riesgo menor al real."
         )
-    report.add_chart("Curva TES — Estructura Temporal (ETTI)", curve.plot_curve())
+    curva_cierre = fi_engine.shocks.curve_at(multi_returns.index[-1])
+    report.add_chart(f"Curva TES — Estructura Temporal (ETTI) al {multi_returns.index[-1].date()}",
+                     curva_cierre.plot_curve())
     report.add_chart("Curva TES — Evolución por nodo", fi_engine.shocks.plot_curve_history())
     report.add_chart("Enfoque C — Screening de bonos individuales", fi_engine.screener.plot_screening())
     report.add_table(
