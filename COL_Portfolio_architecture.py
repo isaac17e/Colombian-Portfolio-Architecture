@@ -7,6 +7,7 @@ from __future__ import annotations
 # --- Librería estándar --------------------------------------------------------
 import logging
 import os
+import ssl
 import warnings
 import zlib
 from dataclasses import dataclass, field
