@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+# ==============================================================================
+# IMPORTACIONES Y CONFIGURACIÓN GLOBAL
+# ==============================================================================
+
+# --- Librería estándar --------------------------------------------------------
 import logging
 import os
 import warnings
@@ -9,28 +14,29 @@ from datetime import datetime
 from enum import Enum
 from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
+# --- Cómputo numérico y estadístico ------------------------------------------
 import numpy as np
 import pandas as pd
 from scipy import interpolate, optimize
 from sklearn.covariance import LedoitWolf
 
+# --- Visualización ------------------------------------------------------------
 import plotly.graph_objects as go
 import plotly.io as pio
 
+# --- Fuente de datos opcional (yfinance) -------------------------------------
 try:
     import yfinance as yf
     _YFINANCE_AVAILABLE = True
-    # yfinance registra como ERROR los tickers sin cobertura ('Data doesn't
-    # exist for startDate...'), que aquí son un caso previsto y resuelto con el
-    # fallback sintético. Se silencia su logger para que el log del motor sólo
-    # reporte incidencias reales; la sustitución se anuncia igual más abajo.
     logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 except ImportError:
     _YFINANCE_AVAILABLE = False
 
+# --- Avisos y tema gráfico ----------------------------------------------------
 warnings.filterwarnings("ignore", category=FutureWarning)
 pio.templates.default = "plotly_white"
 
+# --- Logging ------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
@@ -38,6 +44,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("QuantPM")
 
+# --- Constantes globales ------------------------------------------------------
 TRADING_DAYS: int = 252
 
 
@@ -51,81 +58,64 @@ FECHA_FIN: str = "2024-12-31"
 
 # --- Universo de Renta Variable ----------------------------------------------
 ACCIONES_BVC: List[str] = [
-    "ECOPETROL.CL",     # Ecopetrol
-    "TERPEL.CL",        # Organización Terpel
-    "PROMIGAS.CL",      # Promigas
-    "GRUPOSURA.CL",     # Grupo de Inversiones Suramericana (común)
-    "PFGRUPSURA.CL",    # Grupo Sura (preferencial)
-    "GRUPOARGOS.CL",    # Grupo Argos (común)
-    "PFGRUPOARG.CL",    # Grupo Argos (preferencial)
-    "PFDAVVNDA.CL",     # Davivienda (preferencial)
-    "CEMARGOS.CL",      # Cementos Argos (común)
-    "PFCEMARGOS.CL",    # Cementos Argos (preferencial)
-    "PFAVAL.CL",        # Grupo Aval (preferencial)
-    "NUTRESA.CL",       # Grupo Nutresa
-    "MINEROS.CL",       # Mineros S.A.
-    "ISA.CL",           # Interconexión Eléctrica S.A.
-    "GEB.CL",           # Grupo Energía Bogotá
-    "EXITO.CL",         # Almacenes Éxito
-    "ETB.CL",           # Empresa de Telecomunicaciones de Bogotá
-    "ENKA.CL",          # Enka de Colombia
-    "CELSIA.CL",        # Celsia
-    "BVC.CL",           # Bolsa de Valores de Colombia
-    "BOGOTA.CL",        # Banco de Bogotá
-    "PEI.CL",           # Fideicomiso PEI (títulos inmobiliarios)
-    "CIBEST.CL",        # Cibest (holding de Bancolombia)
-    "PFCORFICOL.CL",    # Corficolombiana (preferencial)
-    "CONCONCRET.CL",    # Conconcreto
-    "CNEC.CL",          # Canacol Energy
-    "BHI.CL",           # BHI
-    "NUAMCO.CL",        # nuam (BVC + Bolsa de Santiago + Bolsa de Lima)
+    "ECOPETROL.CL",
+    "TERPEL.CL",
+    "PROMIGAS.CL",
+    "GRUPOSURA.CL",
+    "PFGRUPSURA.CL",
+    "GRUPOARGOS.CL",
+    "PFGRUPOARG.CL",
+    "PFDAVVNDA.CL",
+    "CEMARGOS.CL",
+    "PFCEMARGOS.CL",
+    "PFAVAL.CL",
+    "NUTRESA.CL",
+    "MINEROS.CL",
+    "ISA.CL",
+    "GEB.CL",
+    "EXITO.CL",
+    "ETB.CL",
+    "ENKA.CL",
+    "CELSIA.CL",
+    "BVC.CL",
+    "BOGOTA.CL",
+    "PEI.CL",
+    "CIBEST.CL",
+    "PFCORFICOL.CL",
+    "CONCONCRET.CL",
+    "CNEC.CL",
+    "BHI.CL",
+    "NUAMCO.CL",
 ]
 ETFS_RV_LOCALES: List[str] = ["ICOLCAP.CL", "HCOLSEL.CL"]
 ETFS_RV_GLOBALES: List[str] = ["SPY", "QQQ"]
 
 # --- Universo de Renta Fija ---------------------------------------------------
-# Enfoque B — vehículos colectivos con precio de mercado observable.
-# Sólo deben listarse tickers con cobertura real en la fuente de datos: un
-# vehículo sin precio se descarta (ver EXCLUIR_ACTIVOS_SIN_PRECIO_REAL) para no
-# introducir un activo inventado en el optimizador.
-ETFS_RF_LOCALES: List[str] = []            # GXTESCOL.CL no tiene histórico en Yahoo Finance
+ETFS_RF_LOCALES: List[str] = []
 ETFS_RF_GLOBALES: List[str] = ["TLT"]
 
-# Enfoque A — nodos de duración de la curva soberana (plazos en años).
 NODOS_TES: List[float] = [1.0, 3.0, 5.0, 10.0]
 
-# Proxy de mercado para el cálculo de betas.
 BENCHMARK: str = "^GSPC"
 
 # --- Curva cero cupón de TES (ETTI) ------------------------------------------
-# Nodos de la curva de referencia. Reemplazables por el archivo de Banrep vía
-# TESYieldCurve.from_banrep_csv(RUTA_CURVA_TES_CSV).
 CURVA_TES_PLAZOS: List[float] = [0.083, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20]
 CURVA_TES_TASAS: List[float] = [
     0.0980, 0.0975, 0.0965, 0.0950, 0.0940, 0.0935, 0.0955, 0.0975, 0.0995, 0.1010, 0.1015
 ]
-RUTA_CURVA_TES_CSV: Optional[str] = None   # p. ej. "datos/etti_banrep.csv"
+RUTA_CURVA_TES_CSV: Optional[str] = None
 
-# Fuente del histórico diario de la curva:
-#   "banrep"   → tasas cero cupón TES en pesos a 1, 5 y 10 años publicadas por el
-#                Banco de la República (SUAMECA), completadas a todos los plazos
-#                con Nelson-Siegel. Si la descarga falla y no hay caché, se usa
-#                la curva simulada y se avisa en el log.
-#   "simulada" → curva fija CURVA_TES_* con choques del modelo de 3 factores.
 CURVA_TES_FUENTE: str = "banrep"
-# Escala de decaimiento de Nelson-Siegel (años) para completar la curva a partir
-# de los tres nodos publicados. Diebold y Li (2006): λ = 0.0609 mensual ≈ 1/1.37.
 CURVA_TES_TAU_NS: float = 1.37
 RUTA_CACHE_CURVA_TES: str = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "datos", "tes_cero_cupon_banrep.csv"
 )
 
-# Plazo de la curva usado como tasa libre de riesgo (debe reflejar el horizonte).
 RF_TENOR_YEARS: float = 1.0
 
 # --- Bandas estratégicas por clase de activo ---------------------------------
-BANDA_RV: Tuple[float, float] = (0.40, 0.60)   # min, max de Renta Variable
-BANDA_RF: Tuple[float, float] = (0.40, 0.60)   # min, max de Renta Fija
+BANDA_RV: Tuple[float, float] = (0.40, 0.60)
+BANDA_RF: Tuple[float, float] = (0.40, 0.60)
 
 # --- Topes de concentración por tipo de instrumento --------------------------
 MAX_PESO_ACCION_INDIVIDUAL: float = 0.15
@@ -141,53 +131,31 @@ BONOS_PLAZO_MAX_ANIOS: float = 10.0
 BONOS_MIN_LIQUIDEZ: float = 0.35
 BONOS_MAX_SPREAD_BP: Optional[float] = 450.0
 BONOS_MAX_POR_EMISOR: int = 2
-# Sólo tasa fija en pesos: los títulos en UVR/IPC cotizan en tasa real y no son
-# comparables con el resto del universo sin modelar la inflación.
 BONOS_INDEXACIONES_PERMITIDAS: Optional[Set[str]] = {"TF"}
 BONOS_EMISORES_EXCLUIDOS: Set[str] = set()
 
 # --- Backtest walk-forward ----------------------------------------------------
 LOOKBACK_DIAS: int = 252
-FRECUENCIA_REBALANCEO: str = "ME"    # 'ME' fin de mes | 'W' semanal | 'QE' trimestral
+FRECUENCIA_REBALANCEO: str = "ME"
 USAR_SHRINKAGE_LEDOIT_WOLF: bool = True
-# Estimador del retorno esperado de los activos sin μ analítico (RV y ETFs):
-#   "bayes_stein" → media muestral contraída hacia la media del portafolio de
-#                   mínima varianza de su clase, con intensidad estimada de los
-#                   datos (Jorion, 1986). Reduce el error de estimación que el
-#                   optimizador de Sharpe amplifica.
-#   "muestral"    → media muestral simple.
 ESTIMADOR_MU: str = "bayes_stein"
 
 # --- Política de datos --------------------------------------------------------
-# Con True, cualquier ticker sin precio real observable queda fuera del universo
-# invertible en vez de sustituirse por una serie simulada. Es lo que evita que un
-# activo inventado compita por peso contra activos con historia real.
 EXCLUIR_ACTIVOS_SIN_PRECIO_REAL: bool = True
-# Si tras el filtro quedan menos activos de RV que este umbral (típicamente por
-# falta de red), el motor entra en modo demostración con series sintéticas.
 MIN_ACTIVOS_RV_REALES: int = 5
 SEMILLA_ALEATORIA: int = 42
 
 # --- Liquidez y cobertura de precios -----------------------------------------
-# Un precio que no se mueve no es un activo sin riesgo: es un activo sin
-# negociación. Sus retornos en cero subestiman volatilidad y correlaciones, y el
-# optimizador de Sharpe lo premia. Se mide sobre la serie propia de cada ticker;
-# Yahoo rellena los festivos de la BVC con el cierre anterior, por lo que aun las
-# acciones más líquidas muestran ~10% de días sin movimiento.
-MAX_PCT_DIAS_SIN_MOVIMIENTO: float = 0.25   # fracción máxima de días con retorno exactamente 0
-MAX_DIAS_PRECIO_CONGELADO: int = 30         # racha máxima de días seguidos con el mismo precio
-# Días máximos que se arrastra un precio al alinear calendarios. Sin tope, un
-# título que deja de cotizar (p. ej. por conversión o deslistamiento) seguiría
-# con precio plano hasta el final de la ventana en vez de quedar sin dato.
+MAX_PCT_DIAS_SIN_MOVIMIENTO: float = 0.25
+MAX_DIAS_PRECIO_CONGELADO: int = 30
 MAX_DIAS_RELLENO_PRECIO: int = 5
-# Holgura (días calendario) para exigir dato real al inicio y al final de la ventana.
 HOLGURA_COBERTURA_DIAS: int = 45
 
 # --- Volatilidad de la curva (modelo de 3 factores, puntos básicos diarios) ---
 CURVA_VOL_NIVEL_BP: float = 5.5
 CURVA_VOL_PENDIENTE_BP: float = 3.5
 CURVA_VOL_CURVATURA_BP: float = 2.5
-CURVA_BETA_RV_BP: float = -1.2       # bp de choque de tasa por 1σ de retorno de RV
+CURVA_BETA_RV_BP: float = -1.2
 
 # --- Salida -------------------------------------------------------------------
 DIRECTORIO_SALIDA: str = os.environ.get(
@@ -235,10 +203,10 @@ class AssetSpec:
     name: str
     asset_class: AssetClass
     sub_class: AssetSubClass
-    expected_return: Optional[float] = None      # μ anual (decimal)
-    modified_duration: Optional[float] = None    # años
+    expected_return: Optional[float] = None
+    modified_duration: Optional[float] = None
     convexity: Optional[float] = None
-    ytm: Optional[float] = None                  # tasa efectiva anual
+    ytm: Optional[float] = None
     metadata: Dict[str, object] = field(default_factory=dict)
 
     def as_row(self) -> Dict[str, object]:
@@ -274,7 +242,7 @@ class AssetUniverse:
     # --- Enfoque A: nodos de duración de la curva soberana (años) ---
     nodos_tes: List[float] = field(default_factory=lambda: list(NODOS_TES))
 
-    benchmark: str = field(default_factory=lambda: BENCHMARK)  # proxy para betas
+    benchmark: str = field(default_factory=lambda: BENCHMARK)
 
     # ------------------------------------------------------------------ #
     @property
@@ -337,16 +305,21 @@ class MarketDataPipeline:
         self.max_fill_days = max_fill_days
         self._rng = np.random.default_rng(seed)
         self.prices_: Optional[pd.DataFrame] = None
-        self._common_factor: Optional[np.ndarray] = None  # factor de mercado compartido (lazy)
-        self.synthetic_tickers_: List[str] = []  # tickers sin datos reales en el rango solicitado
-        self.raw_prices_: Dict[str, pd.Series] = {}  # series reales en su propio calendario
+        self._common_factor: Optional[np.ndarray] = None
+        self.synthetic_tickers_: List[str] = []
+        self.raw_prices_: Dict[str, pd.Series] = {}
 
+    # ------------------------------------------------------------------ #
+    # DESCARGA DE PRECIOS
     # ------------------------------------------------------------------ #
     def fetch_prices(self) -> pd.DataFrame:
         """Descarga precios ajustados de cierre para todos los tickers."""
+        # --- Inicialización del estado ---
         frames: Dict[str, pd.Series] = {}
         self.synthetic_tickers_ = []
         self.raw_prices_ = {}
+
+        # --- Descarga ticker a ticker (yfinance) con fallback sintético ---
         for tk in self.tickers:
             series = None
             if _YFINANCE_AVAILABLE:
@@ -364,7 +337,7 @@ class MarketDataPipeline:
                         series = raw[col].dropna()
                         if isinstance(series, pd.DataFrame):
                             series = series.iloc[:, 0]
-                except Exception as exc:  # pragma: no cover - red externa
+                except Exception as exc:
                     logger.warning("yfinance falló para %s (%s). Usando fallback sintético.", tk, exc)
 
             if series is None or series.empty:
@@ -376,6 +349,7 @@ class MarketDataPipeline:
 
             frames[tk] = series
 
+        # --- Alineación de calendarios y recorte a la ventana ---
         prices = pd.DataFrame(frames)
         prices = prices.sort_index().ffill(limit=self.max_fill_days).dropna(how="all")
         prices = prices.loc[self.start : self.end]
@@ -390,15 +364,14 @@ class MarketDataPipeline:
         idiosincrático propio de cada ticker), de modo que la matriz de
         correlaciones resultante sea realista y útil para la optimización.
         """
+        # --- Calendario y semilla estable por ticker ---
         n_days = max((self.end - self.start).days, 252)
         dates = pd.bdate_range(self.start, periods=n_days)
 
-        # `hash()` sobre strings se aleatoriza por proceso (PYTHONHASHSEED), lo
-        # que haría irreproducible cada corrida. CRC32 es estable entre procesos
-        # y máquinas, de modo que un mismo ticker siempre genera la misma serie.
         local_seed = (zlib.crc32(ticker.encode("utf-8")) + self.seed) % (2**32)
         rng = np.random.default_rng(local_seed)
 
+        # --- Parámetros de mercado según el tipo de activo ---
         tk = ticker.upper()
         is_global_bond_proxy = tk in {"TLT", "IEF", "AGG", "BND"}
         is_local_bond_proxy = tk in {"GXTESCOL.CL", "TESCOL.CL"}
@@ -406,9 +379,8 @@ class MarketDataPipeline:
         is_benchmark = tk in {"^GSPC", "SPY", "QQQ"}
 
         if is_global_bond_proxy:
-            mu, sigma, s0, beta_mkt = 0.03, 0.12, 100.0, -0.15  # TLT anticorrelacionado con equities
+            mu, sigma, s0, beta_mkt = 0.03, 0.12, 100.0, -0.15
         elif is_local_bond_proxy:
-            # ETF de TES: carry alto, volatilidad moderada, baja beta a equities.
             mu, sigma, s0, beta_mkt = 0.085, 0.07, 12000.0, 0.10
         elif is_local_equity:
             mu, sigma, s0, beta_mkt = 0.09, 0.28, 25000.0, 0.55
@@ -417,13 +389,13 @@ class MarketDataPipeline:
         else:
             mu, sigma, s0, beta_mkt = 0.10, 0.20, 400.0, 0.70
 
+        # --- Factor de mercado común ---
         dt = 1 / TRADING_DAYS
-        # Factor de mercado común: se genera una única vez por pipeline y se
-        # reutiliza para todos los tickers, garantizando co-movimiento realista.
         if self._common_factor is None or len(self._common_factor) != len(dates):
             self._common_factor = self._rng.normal(0, np.sqrt(dt), size=len(dates))
         common_factor = self._common_factor
 
+        # --- Choques y trayectoria de precios (GBM) ---
         idio_vol = sigma * np.sqrt(max(1 - beta_mkt**2, 0.05))
         idio_shocks = rng.normal(0, idio_vol * np.sqrt(dt), size=len(dates))
         total_shocks = beta_mkt * sigma * common_factor + idio_shocks
@@ -433,6 +405,8 @@ class MarketDataPipeline:
         prices = s0 * np.exp(log_path)
         return pd.Series(prices, index=dates, name=ticker)
 
+    # ------------------------------------------------------------------ #
+    # CALIDAD DE DATOS
     # ------------------------------------------------------------------ #
     def liquidity_report(self) -> pd.DataFrame:
         """
@@ -451,6 +425,8 @@ class MarketDataPipeline:
             }
         return pd.DataFrame.from_dict(rows, orient="index")
 
+    # ------------------------------------------------------------------ #
+    # TRANSFORMACIONES Y ENSAMBLE DE LA MATRIZ
     # ------------------------------------------------------------------ #
     @staticmethod
     def compute_returns(prices: pd.DataFrame, method: str = "log") -> pd.DataFrame:
@@ -543,6 +519,8 @@ class TESYieldCurve:
         )
 
     # ------------------------------------------------------------------ #
+    # CONSTRUCTORES
+    # ------------------------------------------------------------------ #
     @classmethod
     def from_banrep_csv(cls, path: str) -> "TESYieldCurve":
         """
@@ -582,6 +560,8 @@ class TESYieldCurve:
         return cls.from_config()
 
     # ------------------------------------------------------------------ #
+    # CONSULTA DE TASAS Y FACTORES DE DESCUENTO
+    # ------------------------------------------------------------------ #
     def get_rate(self, t: Union[float, np.ndarray]) -> Union[float, np.ndarray]:
         """Tasa cero cupón interpolada (efectiva anual) para el plazo t (años)."""
         t_arr = np.asarray(t, dtype=float)
@@ -614,6 +594,8 @@ class TESYieldCurve:
             return float(self.get_rate(maturity_years))
         return float((1.0 - dfs[-1]) / annuity)
 
+    # ------------------------------------------------------------------ #
+    # VISUALIZACIONES
     # ------------------------------------------------------------------ #
     def plot_curve(self, label: str = "ETTI TES") -> go.Figure:
         """Grafica interactiva (Plotly) de la curva observada (puntos) y la interpolación (línea)."""
@@ -650,7 +632,7 @@ class BanrepTESHistory:
 
     URL = ("https://suameca.banrep.gov.co/estadisticas-economicas-back/rest/"
            "estadisticaEconomicaRestService/consultaInformacionSerie")
-    SERIES: Dict[float, int] = {1.0: 15272, 5.0: 15273, 10.0: 15274}   # TES pesos
+    SERIES: Dict[float, int] = {1.0: 15272, 5.0: 15273, 10.0: 15274}
     _HEADERS = {
         "User-Agent": "Mozilla/5.0",
         "Accept": "application/json",
@@ -663,18 +645,22 @@ class BanrepTESHistory:
         self.timeout = timeout
 
     # ------------------------------------------------------------------ #
+    # OBTENCIÓN DEL HISTÓRICO
+    # ------------------------------------------------------------------ #
     def fetch(self, start: Union[str, pd.Timestamp], end: Union[str, pd.Timestamp]) -> pd.DataFrame:
         """
         Tasas E.A. en decimal (índice = fechas hábiles, columnas = plazos en
         años) para la ventana [start, end].
         """
+        # --- Lectura de caché local ---
         start, end = pd.Timestamp(start), pd.Timestamp(end)
         cached = self._read_cache()
-        # Holgura de una semana para fines de semana y festivos en los bordes.
         slack = pd.Timedelta(days=7)
         if cached is not None and cached.index[0] <= start + slack and cached.index[-1] >= end - slack:
             logger.info("Curva TES histórica leída de la caché %s.", self.cache_path)
             return cached.loc[start:end]
+
+        # --- Descarga desde SUAMECA (con respaldo en caché) ---
         try:
             data = self._download()
         except Exception as exc:
@@ -683,6 +669,8 @@ class BanrepTESHistory:
             logger.warning("Descarga de la curva TES falló (%s); se usa la caché %s aunque no "
                            "cubra toda la ventana.", exc, self.cache_path)
             return cached.loc[start:end]
+
+        # --- Actualización de caché y recorte a la ventana ---
         self._write_cache(data)
         logger.info("Curva TES histórica descargada de Banrep: %d días (%s a %s).",
                     len(data), data.index[0].date(), data.index[-1].date())
@@ -692,18 +680,22 @@ class BanrepTESHistory:
     def _download(self) -> pd.DataFrame:
         import json
 
+        # --- Descarga de una serie por plazo ---
         cols: Dict[float, pd.Series] = {}
         for tenor, series_id in self.SERIES.items():
             payload = json.loads(self._get(f"{self.URL}?idSerie={series_id}").decode("utf-8"))
             if not payload or not payload[0].get("data"):
                 raise ValueError(f"Serie {series_id} vacía en SUAMECA.")
-            # Marcas de tiempo en milisegundos a medianoche de Bogotá.
             ms, values = zip(*payload[0]["data"])
             idx = (pd.to_datetime(list(ms), unit="ms", utc=True)
                    .tz_convert("America/Bogota").normalize().tz_localize(None))
             cols[tenor] = pd.Series(np.asarray(values, dtype=float) / 100.0, index=idx)
+
+        # --- Ensamble en un solo DataFrame (fechas x plazos) ---
         return pd.DataFrame(cols).sort_index().dropna(how="any")
 
+    # ------------------------------------------------------------------ #
+    # CONEXIÓN SEGURA (TLS)
     # ------------------------------------------------------------------ #
     def _get(self, url: str) -> bytes:
         """
@@ -717,6 +709,7 @@ class BanrepTESHistory:
         import urllib.error
         import urllib.request
 
+        # --- Primer intento: verificación TLS estándar ---
         req = urllib.request.Request(url, headers=self._HEADERS)
         context = self._base_ssl_context()
         try:
@@ -725,6 +718,8 @@ class BanrepTESHistory:
         except urllib.error.URLError as exc:
             if not isinstance(exc.reason, ssl.SSLCertVerificationError):
                 raise
+
+        # --- Reintento: completando la cadena con el intermedio (AIA) ---
         host = urllib.request.urlparse(url).hostname
         context = self._context_with_intermediate(host)
         with urllib.request.urlopen(req, timeout=self.timeout, context=context) as resp:
@@ -735,8 +730,6 @@ class BanrepTESHistory:
     def _base_ssl_context() -> "ssl.SSLContext":
         import ssl
 
-        # Algunas instalaciones de Python (p. ej. Homebrew en macOS) no traen
-        # certificados raíz; certifi (dependencia de yfinance) los provee.
         try:
             import certifi
             return ssl.create_default_context(cafile=certifi.where())
@@ -749,17 +742,14 @@ class BanrepTESHistory:
         import ssl
         import urllib.request
 
-        # El certificado del servidor se lee sin verificar sólo para extraer la
-        # URL 'CA Issuers' (texto ASCII dentro del DER); no se confía en él.
+        # --- Localizar la URL del certificado intermedio ---
         leaf_der = ssl.PEM_cert_to_DER_cert(ssl.get_server_certificate((host, 443), timeout=self.timeout))
         urls = re.findall(rb"http://[\x21-\x7e]+?\.(?:crt|cer|der)", leaf_der)
         if not urls:
             raise ssl.SSLError(f"{host}: cadena TLS incompleta y sin URL del emisor (AIA).")
 
+        # --- Contexto TLS estricto con el intermedio descargado ---
         context = self._base_ssl_context()
-        # Sin PARTIAL_CHAIN (activo por defecto desde Python 3.13), el intermedio
-        # sólo sirve para construir la cadena: ésta debe terminar en una raíz de
-        # confianza, así que un intermedio adulterado no valida nada.
         context.verify_flags &= ~getattr(ssl, "VERIFY_X509_PARTIAL_CHAIN", 0)
         for url in urls:
             with urllib.request.urlopen(url.decode("ascii"), timeout=self.timeout) as resp:
@@ -768,6 +758,8 @@ class BanrepTESHistory:
             context.load_verify_locations(cadata=pem)
         return context
 
+    # ------------------------------------------------------------------ #
+    # CACHÉ LOCAL
     # ------------------------------------------------------------------ #
     def _read_cache(self) -> Optional[pd.DataFrame]:
         if not self.cache_path or not os.path.exists(self.cache_path):
@@ -783,6 +775,8 @@ class BanrepTESHistory:
         data.to_csv(self.cache_path, index_label="fecha")
 
     # ------------------------------------------------------------------ #
+    # COMPLETAR LA CURVA (NELSON-SIEGEL)
+    # ------------------------------------------------------------------ #
     @staticmethod
     def complete_curve(nodes: pd.DataFrame, tenors: Sequence[float], tau: float) -> pd.DataFrame:
         """
@@ -791,8 +785,11 @@ class BanrepTESHistory:
         los tres β quedan determinados exactamente, y la curva resultante pasa
         por los nodos y extrapola de forma acotada fuera de ellos.
         """
+        # --- Ajuste diario de los β de Nelson-Siegel sobre los nodos ---
         node_t = np.asarray(nodes.columns, dtype=float)
         betas = np.linalg.solve(nelson_siegel_loadings(node_t, tau), nodes.to_numpy().T).T
+
+        # --- Evaluación de la curva en todos los plazos ---
         levels = betas @ nelson_siegel_loadings(tenors, tau).T
         return pd.DataFrame(levels, index=nodes.index, columns=[float(t) for t in tenors])
 
@@ -813,7 +810,6 @@ class BondAnalytics:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Tiempos (años) y flujos de caja de un bono bullet con cupón periódico."""
         n = max(int(np.ceil(maturity_years * freq)), 1)
-        # El primer cupón puede tener periodo fraccionario (bono ya emitido).
         times = maturity_years - np.arange(n - 1, -1, -1, dtype=float) / freq
         times = np.clip(times, 1e-6, None)
         cfs = np.full(n, face * coupon_rate / freq, dtype=float)
@@ -900,10 +896,10 @@ class CurveShockConfig:
     level_vol_bp: float = field(default_factory=lambda: CURVA_VOL_NIVEL_BP)
     slope_vol_bp: float = field(default_factory=lambda: CURVA_VOL_PENDIENTE_BP)
     curvature_vol_bp: float = field(default_factory=lambda: CURVA_VOL_CURVATURA_BP)
-    tau: float = 2.5                 # escala de decaimiento Nelson-Siegel (años)
-    mean_reversion: float = 0.015    # reversión diaria de los factores al nivel base
-    equity_beta_bp: float = field(default_factory=lambda: CURVA_BETA_RV_BP)  # bp por 1σ de RV
-    floor_rate: float = 0.005        # piso de la tasa simulada
+    tau: float = 2.5
+    mean_reversion: float = 0.015
+    equity_beta_bp: float = field(default_factory=lambda: CURVA_BETA_RV_BP)
+    floor_rate: float = 0.005
     seed: int = field(default_factory=lambda: SEMILLA_ALEATORIA)
 
 
@@ -931,8 +927,10 @@ class CurveShockGenerator:
         self.config = config or CurveShockConfig()
         self.levels_: Optional[pd.DataFrame] = None
         self.changes_: Optional[pd.DataFrame] = None
-        self.source_: Optional[str] = None   # "simulada" | "histórica"
+        self.source_: Optional[str] = None
 
+    # ------------------------------------------------------------------ #
+    # GENERACIÓN DE LA CURVA DIARIA
     # ------------------------------------------------------------------ #
     def _nelson_siegel_loadings(self) -> np.ndarray:
         """Matriz (n_tenors x 3) de cargas factoriales nivel/pendiente/curvatura."""
@@ -946,13 +944,14 @@ class CurveShockGenerator:
         Simula niveles diarios de la curva. Retorna un DataFrame
         (index = fechas, columns = plazos en años, valores = tasa E.A.).
         """
+        # --- Configuración y cargas factoriales ---
         cfg = self.config
         rng = np.random.default_rng(cfg.seed)
         n = len(dates)
         loadings = self._nelson_siegel_loadings()
         factor_vols = np.array([cfg.level_vol_bp, cfg.slope_vol_bp, cfg.curvature_vol_bp]) / 1e4
 
-        # Factores con reversión a la media (Ornstein-Uhlenbeck discretizado).
+        # --- Factores con reversión a la media ---
         factors = np.zeros((n, 3))
         f = np.zeros(3)
         for i in range(n):
@@ -960,18 +959,18 @@ class CurveShockGenerator:
             factors[i] = f
 
         delta_factors = np.diff(np.vstack([np.zeros((1, 3)), factors]), axis=0)
-        changes = delta_factors @ loadings.T  # (n x n_tenors)
+        changes = delta_factors @ loadings.T
 
-        # Componente correlacionado con la renta variable.
+        # --- Componente correlacionado con la renta variable ---
         if market_returns is not None and cfg.equity_beta_bp != 0.0:
             mkt = market_returns.reindex(dates).fillna(0.0).values
             sigma_mkt = float(np.std(mkt)) or 1.0
             equity_shock = (cfg.equity_beta_bp / 1e4) * (mkt / sigma_mkt)
             changes = changes + equity_shock[:, None] * loadings[:, 0][None, :]
 
+        # --- Niveles de la curva con piso y registro del resultado ---
         base = np.asarray(self.curve.get_rate(self.tenors), dtype=float)
         levels = np.maximum(base[None, :] + np.cumsum(changes, axis=0), cfg.floor_rate)
-        # Re-derivar los cambios efectivos tras aplicar el piso de tasa.
         levels_df = pd.DataFrame(levels, index=dates, columns=self.tenors)
         self.levels_ = levels_df
         self.changes_ = levels_df.diff().fillna(0.0)
@@ -985,17 +984,22 @@ class CurveShockGenerator:
         índice y plazos (años) en las columnas, con tasas en decimal. Los
         plazos solicitados se interpolan linealmente sobre los disponibles.
         """
+        # --- Interpolación a los plazos solicitados ---
         hist = history.sort_index().astype(float)
         available = np.asarray([float(c) for c in hist.columns], dtype=float)
         interp = np.vstack([
             np.interp(self.tenors, available, row) for row in hist.values
         ])
+
+        # --- Registro de niveles y variaciones ---
         levels_df = pd.DataFrame(interp, index=hist.index, columns=self.tenors)
         self.levels_ = levels_df
         self.changes_ = levels_df.diff().fillna(0.0)
         self.source_ = "histórica"
         return levels_df
 
+    # ------------------------------------------------------------------ #
+    # CONSULTA E INTERPOLACIÓN
     # ------------------------------------------------------------------ #
     def changes_at(self, maturities: Sequence[float]) -> pd.DataFrame:
         """Interpola las variaciones diarias Δy a plazos arbitrarios."""
@@ -1035,6 +1039,8 @@ class CurveShockGenerator:
         pos = int(np.clip(pos, 0, len(idx) - 1))
         return TESYieldCurve.from_levels(self.tenors, self.levels_.iloc[pos].values)
 
+    # ------------------------------------------------------------------ #
+    # VISUALIZACIONES
     # ------------------------------------------------------------------ #
     def plot_curve_history(self) -> go.Figure:
         """Evolución del nivel de la curva por nodo de plazo."""
@@ -1081,6 +1087,8 @@ class TESNodeBuilder:
         self.include_rolldown = include_rolldown
 
     # ------------------------------------------------------------------ #
+    # ANALÍTICA Y FICHAS DE LOS NODOS
+    # ------------------------------------------------------------------ #
     @staticmethod
     def ticker_for(tenor: float) -> str:
         return f"TES_{tenor:g}Y"
@@ -1088,6 +1096,7 @@ class TESNodeBuilder:
     # ------------------------------------------------------------------ #
     def _node_analytics(self, curve: TESYieldCurve, tenor: float) -> Dict[str, float]:
         """Analítica de un nodo bajo una curva dada (par-cupón a la par)."""
+        # --- Cupón par, YTM, duración y convexidad ---
         coupon = curve.par_yield(tenor, freq=self.coupon_freq)
         times, cfs = BondAnalytics.cashflow_schedule(tenor, coupon, self.coupon_freq)
         ytm = BondAnalytics.ytm_from_price(times, cfs, 100.0)
@@ -1095,10 +1104,9 @@ class TESNodeBuilder:
             ytm = coupon
         _, dmod, conv = BondAnalytics.duration_convexity(times, cfs, ytm)
 
+        # --- Roll-down ---
         rolldown = 0.0
         if self.include_rolldown and tenor > 1.0:
-            # Al cabo de un año el título "rueda" al plazo T−1: la ganancia de
-            # precio es ≈ D_mod·(y_T − y_{T−1}).
             rolldown = dmod * (float(curve.get_rate(tenor)) - float(curve.get_rate(tenor - 1.0)))
         return {"coupon": coupon, "ytm": ytm, "dmod": dmod, "convexity": conv, "rolldown": rolldown}
 
@@ -1123,6 +1131,8 @@ class TESNodeBuilder:
         return specs
 
     # ------------------------------------------------------------------ #
+    # RETORNOS DIARIOS DE LOS NODOS
+    # ------------------------------------------------------------------ #
     def build_returns(
         self, shocks: CurveShockGenerator, specs: Optional[Sequence[AssetSpec]] = None
     ) -> pd.DataFrame:
@@ -1137,22 +1147,26 @@ class TESNodeBuilder:
         anterior: con tasas que se mueven de 2% a 13% (2021-2022), fijarlos en
         la curva inicial distorsionaría el retorno.
         """
+        # --- Calendario y fichas de los nodos ---
         node_specs = list(specs or self.build_specs())
         idx = shocks.levels_.index
         d_tau = np.diff(np.asarray((idx - idx[0]).days, dtype=float) / 365.25, prepend=0.0)
         out: Dict[str, pd.Series] = {}
+
         for spec in node_specs:
+            # --- Cupón par, duración y convexidad rezagados un día ---
             tenor = float(spec.metadata["plazo_anios"])
             par = self._par_yield_history(shocks, tenor)
             dmod, conv = self._par_bond_risk(par, tenor)
             prev = lambda x: np.concatenate([[x[0]], x[:-1]])
             par_prev, dmod_prev, conv_prev = prev(par), prev(dmod), prev(conv)
 
+            # --- Componentes del retorno: carry, roll-down y precio ---
             dc = np.diff(par, prepend=par[0])
             carry = (1.0 + par_prev) ** d_tau - 1.0
             rolldown = np.zeros_like(par)
             if self.include_rolldown and tenor > 1.0:
-                slope = par - self._par_yield_history(shocks, tenor - 1.0)   # por año de plazo
+                slope = par - self._par_yield_history(shocks, tenor - 1.0)
                 rolldown = dmod_prev * prev(slope) * d_tau
             price_ret = -dmod_prev * dc + 0.5 * conv_prev * dc ** 2
             out[spec.ticker] = pd.Series(carry + rolldown + price_ret, index=idx)
@@ -1164,7 +1178,7 @@ class TESNodeBuilder:
         f = self.coupon_freq
         n = max(int(round(tenor * f)), 1)
         times = np.arange(1, n + 1, dtype=float) / f
-        zeros = shocks.levels_at(times).to_numpy()            # (fechas x pagos)
+        zeros = shocks.levels_at(times).to_numpy()
         dfs = (1.0 + zeros) ** (-times[None, :])
         return (1.0 - dfs[:, -1]) / (dfs.sum(axis=1) / f)
 
@@ -1188,8 +1202,6 @@ class TESNodeBuilder:
 # 6. ENFOQUE C — SCREENING DE BONOS INDIVIDUALES (ISIN / emisor / rating)
 # ==============================================================================
 
-# Escala local de calificación (BRC / Fitch Ratings Colombia), ordinal ascendente
-# en riesgo: 1 = mejor calidad crediticia.
 RATING_SCALE: Dict[str, int] = {
     "AAA": 1, "AA+": 2, "AA": 3, "AA-": 4,
     "A+": 5, "A": 6, "A-": 7,
@@ -1214,15 +1226,15 @@ class BondSpec:
     isin: str
     emisor: str
     rating: str
-    coupon_rate: float                    # cupón nominal anual (decimal)
+    coupon_rate: float
     maturity_date: Union[str, datetime]
-    ytm: Optional[float] = None           # tasa de negociación E.A. (decimal)
-    price: Optional[float] = None         # precio sucio por 100 de nominal
-    spread_bp: Optional[float] = None     # spread sobre la curva TES (pb)
+    ytm: Optional[float] = None
+    price: Optional[float] = None
+    spread_bp: Optional[float] = None
     freq: int = 1
     face: float = 100.0
-    indexacion: str = "TF"                # TF | IPC | UVR | IBR
-    liquidez: float = 0.5                 # score 0–1 (proxy de profundidad de mercado)
+    indexacion: str = "TF"
+    liquidez: float = 0.5
     sector: str = "Corporativo"
 
 
@@ -1273,8 +1285,10 @@ class BondScreener:
         self.reinvest_tenor = float(reinvest_tenor)
         self.report_: Optional[pd.DataFrame] = None
         self.approved_: List[AssetSpec] = []
-        self.spread_paths_: Optional[pd.DataFrame] = None  # spread simulado (decimal) por bono y fecha
+        self.spread_paths_: Optional[pd.DataFrame] = None
 
+    # ------------------------------------------------------------------ #
+    # UNIVERSO DE BONOS
     # ------------------------------------------------------------------ #
     @staticmethod
     def default_universe(as_of: Union[str, datetime] = "2021-01-01") -> List[BondSpec]:
@@ -1322,12 +1336,16 @@ class BondScreener:
         ]
 
     # ------------------------------------------------------------------ #
+    # ANALÍTICA Y CRITERIOS DE ELEGIBILIDAD
+    # ------------------------------------------------------------------ #
     def _analytics(self, bond: BondSpec) -> Dict[str, float]:
         """Plazo residual, YTM, precio, duración modificada, convexidad y spread."""
+        # --- Plazo residual y flujos de caja ---
         ttm = float((pd.Timestamp(bond.maturity_date) - self.as_of).days) / 365.25
         ttm = max(ttm, 1e-3)
         times, cfs = BondAnalytics.cashflow_schedule(ttm, bond.coupon_rate, bond.freq, bond.face)
 
+        # --- YTM y precio (según el dato disponible) ---
         if bond.ytm is not None:
             ytm = float(bond.ytm)
             price = BondAnalytics.price_from_ytm(times, cfs, ytm)
@@ -1340,6 +1358,7 @@ class BondScreener:
         else:
             raise ValueError(f"El bono {bond.isin} debe traer 'ytm', 'price' o 'spread_bp'.")
 
+        # --- Duración, convexidad y spread sobre la curva ---
         _, dmod, conv = BondAnalytics.duration_convexity(times, cfs, ytm)
         spread_bp = (ytm - float(self.curve.get_rate(ttm))) * 1e4
         return {
@@ -1397,11 +1416,14 @@ class BondScreener:
         return pd.Index(drop)
 
     # ------------------------------------------------------------------ #
+    # SCREENING
+    # ------------------------------------------------------------------ #
     def screen(self) -> pd.DataFrame:
         """
         Aplica los filtros y construye el reporte de screening. Retorna un
         DataFrame con la analítica de cada título y su veredicto.
         """
+        # --- Analítica y veredicto por título ---
         rows: List[Dict[str, object]] = []
         for bond in self.bonds:
             a = self._analytics(bond)
@@ -1415,14 +1437,14 @@ class BondScreener:
 
         report = pd.DataFrame(rows).set_index("isin")
 
-        # Límite de concentración por emisor: se conservan los títulos de mayor
-        # YTM ajustada por liquidez dentro de cada emisor aprobado.
+        # --- Límite de concentración por emisor ---
         drop = self._cap_per_issuer(report[report["aprobado"]])
         report.loc[drop, "aprobado"] = False
         report.loc[drop, "motivo_rechazo"] = (
             f"excede máximo de {self.criteria.max_por_emisor} títulos por emisor"
         )
 
+        # --- Registro del reporte ---
         self.report_ = report
         logger.info(
             "Screening de bonos: %d/%d títulos aprobados.",
@@ -1430,6 +1452,8 @@ class BondScreener:
         )
         return report
 
+    # ------------------------------------------------------------------ #
+    # FICHAS DE LOS BONOS CANDIDATOS
     # ------------------------------------------------------------------ #
     def approved_specs(self, include_rolldown: bool = True) -> List[AssetSpec]:
         """Convierte los bonos aprobados en `as_of` en activos candidatos del optimizador."""
@@ -1469,6 +1493,7 @@ class BondScreener:
         tiempo (plazo residual, YTM, spread vigente) y el máximo por emisor.
         Sólo usa información disponible en esa fecha.
         """
+        # --- Criterios dependientes de la fecha ---
         rows: Dict[str, Dict[str, object]] = {}
         for spec in specs:
             a = self.analytics_at(spec, curve, date, include_rolldown=False)
@@ -1476,6 +1501,8 @@ class BondScreener:
                 continue
             rows[spec.ticker] = {"emisor": spec.metadata["emisor"], "ytm": a["ytm"],
                                  "liquidez": float(spec.metadata["liquidez"])}
+
+        # --- Máximo de títulos por emisor ---
         passed = pd.DataFrame.from_dict(rows, orient="index")
         return [tk for tk in passed.index if tk not in self._cap_per_issuer(passed)]
 
@@ -1510,6 +1537,8 @@ class BondScreener:
         return specs
 
     # ------------------------------------------------------------------ #
+    # RETORNOS DIARIOS (REVALUACIÓN COMPLETA)
+    # ------------------------------------------------------------------ #
     def build_returns(
         self,
         shocks: CurveShockGenerator,
@@ -1534,12 +1563,14 @@ class BondScreener:
         precio converge a la par. Tras el vencimiento el capital se reinvierte
         a la tasa de la curva al plazo `reinvest_tenor`.
         """
+        # --- Validaciones y universo de bonos ---
         bond_specs = list(specs or self.approved_specs())
         if not bond_specs:
             return pd.DataFrame(index=shocks.changes_.index if shocks.changes_ is not None else None)
         if shocks.levels_ is None:
             raise RuntimeError("Ejecute simulate() o from_history() en el generador de choques primero.")
 
+        # --- Calendario, curva y retorno de reinversión ---
         levels = shocks.levels_
         tenors = np.asarray(levels.columns, dtype=float)
         level_rows = levels.to_numpy()
@@ -1551,19 +1582,23 @@ class BondScreener:
         rng = np.random.default_rng(seed)
         out: Dict[str, pd.Series] = {}
         spreads: Dict[str, pd.Series] = {}
+
         for spec in bond_specs:
+            # --- Flujos y plazo inicial del bono ---
             pay_t, cfs = self._cashflow_calendar(spec)
             ttm0 = float(spec.metadata["plazo_anios"])
 
+            # --- Spread simulado (escalado por iliquidez) ---
             liq = float(spec.metadata.get("liquidez", 0.5))
             spread_shock = rng.normal(0.0, (spread_vol_bp / 1e4) * (1.5 - liq), size=len(levels))
             spread = float(spec.metadata["spread_bp"]) / 1e4 + np.cumsum(spread_shock)
 
+            # --- YTM diaria: curva al plazo residual + spread ---
             ttm = np.maximum(ttm0 - tau, 0.0)
             zero = np.array([np.interp(m, tenors, row) for m, row in zip(ttm, level_rows)])
             ytm = zero + spread
 
-            # Matriz (fechas x flujos): tiempo hasta cada pago y flujos pendientes.
+            # --- Revaluación completa: precio y cupones cobrados ---
             t_to_pay = pay_t[None, :] - tau[:, None]
             pending = t_to_pay > 0.0
             disc = (1.0 + ytm[:, None]) ** (-np.where(pending, t_to_pay, 0.0))
@@ -1571,13 +1606,15 @@ class BondScreener:
             paid = np.zeros(len(tau))
             paid[1:] = (cfs[None, :] * (pending[:-1] & ~pending[1:])).sum(axis=1)
 
+            # --- Retorno total (con reinversión tras el vencimiento) ---
             ret = np.zeros(len(tau))
-            alive_prev = pending[:-1].any(axis=1)          # el bono existía al cierre anterior
+            alive_prev = pending[:-1].any(axis=1)
             prev_price = price[:-1]
             with np.errstate(divide="ignore", invalid="ignore"):
                 bond_ret = (price[1:] + paid[1:]) / prev_price - 1.0
             ret[1:] = np.where(alive_prev, bond_ret, cash_ret[1:])
 
+            # --- Registro de la serie y aviso de vencimiento ---
             out[spec.ticker] = pd.Series(ret, index=levels.index)
             spreads[spec.ticker] = pd.Series(spread, index=levels.index)
 
@@ -1589,6 +1626,7 @@ class BondScreener:
                     spec.ticker, spec.metadata.get("vencimiento", "?"), self.reinvest_tenor,
                 )
 
+        # --- Salida ---
         self.spread_paths_ = pd.DataFrame(spreads)
         return pd.DataFrame(out)
 
@@ -1607,6 +1645,8 @@ class BondScreener:
         )
 
     # ------------------------------------------------------------------ #
+    # ANALÍTICA A UNA FECHA
+    # ------------------------------------------------------------------ #
     def analytics_at(
         self,
         spec: AssetSpec,
@@ -1620,24 +1660,31 @@ class BondScreener:
         (conocido en t, sin mirar el futuro). Si el bono ya venció, μ es la
         tasa de reinversión.
         """
+        # --- Flujos pendientes a la fecha ---
         date = pd.Timestamp(date)
         tau = float(self._years_since_as_of(date)[0])
         pay_t, cfs = self._cashflow_calendar(spec)
         pending = pay_t > tau
+
+        # --- Bono vencido: rinde la tasa de reinversión ---
         if not pending.any():
             rate = float(curve.get_rate(self.reinvest_tenor))
             return {"plazo_anios": 0.0, "ytm": rate, "duracion_mod": 0.0, "convexidad": 0.0,
                     "spread_bp": 0.0, "rolldown": 0.0, "mu": rate, "vencido": 1.0}
 
+        # --- Spread vigente en la fecha ---
         spread = float(spec.metadata["spread_bp"]) / 1e4
         if self.spread_paths_ is not None and spec.ticker in self.spread_paths_:
             path = self.spread_paths_[spec.ticker]
             pos = int(np.clip(path.index.searchsorted(date, side="right") - 1, 0, len(path) - 1))
             spread = float(path.iloc[pos])
 
+        # --- YTM, duración y convexidad ---
         ttm = float(pay_t[-1] - tau)
         ytm = float(curve.get_rate(ttm)) + spread
         _, dmod, conv = BondAnalytics.duration_convexity(pay_t[pending] - tau, cfs[pending], ytm)
+
+        # --- Roll-down y μ ---
         rolldown = 0.0
         if include_rolldown and ttm > 1.0:
             rolldown = dmod * (float(curve.get_rate(ttm)) - float(curve.get_rate(ttm - 1.0)))
@@ -1645,8 +1692,11 @@ class BondScreener:
                 "spread_bp": spread * 1e4, "rolldown": rolldown, "mu": ytm + rolldown, "vencido": 0.0}
 
     # ------------------------------------------------------------------ #
+    # VISUALIZACIONES
+    # ------------------------------------------------------------------ #
     def plot_screening(self) -> go.Figure:
         """Mapa plazo–YTM del universo de bonos, coloreado por veredicto."""
+        # --- Puntos del universo por veredicto ---
         report = self.report_ if self.report_ is not None else self.screen()
         fig = go.Figure()
         for aprobado, color, label in [(True, "seagreen", "Aprobado"), (False, "indianred", "Rechazado")]:
@@ -1660,11 +1710,15 @@ class BondScreener:
                       zip(sub.index, sub["emisor"], sub["rating"], sub["motivo_rechazo"])],
                 hovertemplate="%{text}<br>Plazo: %{x:.2f}A<br>YTM: %{y:.2f}%<extra></extra>",
             ))
+
+        # --- Curva TES de referencia ---
         t_fine = np.linspace(0.25, max(float(report["plazo_anios"].max()), 10.0), 200)
         fig.add_trace(go.Scatter(
             x=t_fine, y=np.asarray(self.curve.get_rate(t_fine)) * 100, mode="lines",
             name="Curva TES (referencia)", line=dict(width=2, dash="dot", color="steelblue"),
         ))
+
+        # --- Formato ---
         fig.update_layout(
             title=(f"Screening de bonos individuales — criterio: rating ≥ {self.criteria.min_rating}, "
                    f"plazo ∈ [{self.criteria.min_maturity_years:g}, {self.criteria.max_maturity_years:g}] años"),
@@ -1682,9 +1736,9 @@ class FixedIncomeBundle:
     """Resultado del ensamble de la pata de renta fija."""
 
     specs: Dict[str, AssetSpec]
-    prices: pd.DataFrame                 # nodos TES + bonos (base 100)
-    returns: pd.DataFrame                # retornos simples diarios
-    analytics: pd.DataFrame              # tabla μ / YTM / duración / convexidad
+    prices: pd.DataFrame
+    returns: pd.DataFrame
+    analytics: pd.DataFrame
     screening_report: pd.DataFrame
     curve_levels: pd.DataFrame
 
@@ -1717,18 +1771,24 @@ class FixedIncomeEngine:
         as_of: Optional[Union[str, datetime]] = None,
         include_rolldown: bool = True,
     ) -> None:
+        # --- Enfoque A: constructor de nodos TES ---
         self.curve = curve
         self.node_builder = TESNodeBuilder(curve, node_tenors, include_rolldown=include_rolldown)
         self.include_rolldown = include_rolldown
-        # Plazos de la curva a simular: nodos del Enfoque A + plazos de la curva base.
+
+        # --- Generador de choques de curva ---
         tenors = sorted(set([float(t) for t in node_tenors]) | set(curve.tenors.tolist()))
         self.shocks = CurveShockGenerator(curve, tenors, shock_config)
+
+        # --- Enfoque C: screener de bonos individuales ---
         self.screener = BondScreener(
             bonds if bonds is not None else BondScreener.default_universe(as_of or "2021-01-01"),
             criteria, curve, as_of,
         )
         self.bundle_: Optional[FixedIncomeBundle] = None
 
+    # ------------------------------------------------------------------ #
+    # ENSAMBLE DE LA RENTA FIJA
     # ------------------------------------------------------------------ #
     def build(
         self,
@@ -1741,21 +1801,19 @@ class FixedIncomeEngine:
         `dates`. Si se entrega `curve_history` (histórico real de Banrep) se usa
         en lugar del simulador de choques.
         """
+        # --- Curva diaria: histórica o simulada ---
         if curve_history is not None:
-            # El histórico viene en días hábiles de Colombia; se lleva al
-            # calendario del resto del universo arrastrando el último dato.
             hist = curve_history.sort_index()
             hist = hist.reindex(hist.index.union(pd.DatetimeIndex(dates))).ffill().bfill()
             self.shocks.from_history(hist.reindex(pd.DatetimeIndex(dates)))
         else:
             self.shocks.simulate(pd.DatetimeIndex(dates), market_returns)
 
+        # --- Enfoque A: nodos TES ---
         node_specs = self.node_builder.build_specs()
         node_returns = self.node_builder.build_returns(self.shocks, node_specs)
 
-        # Se modelan todos los bonos que podrían ser elegibles en algún momento
-        # de la ventana; cuáles son invertibles se decide en cada fecha con
-        # `excluded_bonds_at` (screening dinámico).
+        # --- Enfoque C: bonos individuales ---
         self.screener.screen()
         approved_now = self.screener.approved_specs(include_rolldown=self.include_rolldown)
         bond_specs = self.screener.candidate_specs(
@@ -1763,13 +1821,15 @@ class FixedIncomeEngine:
         )
         bond_returns = self.screener.build_returns(self.shocks, bond_specs)
 
+        # --- Ensamble de retornos, precios y analítica ---
         returns = pd.concat([node_returns, bond_returns], axis=1) if not bond_returns.empty else node_returns
         prices = MarketDataPipeline.prices_from_returns(returns, base=100.0)
 
         specs = {s.ticker: s for s in list(node_specs) + list(bond_specs)}
         analytics = pd.DataFrame([s.as_row() for s in specs.values()]).set_index("ticker")
 
-        self.bundle_ = FixedIncomeBundle(
+        # --- Paquete de salida ---
+        self.bundle_ =FixedIncomeBundle(
             specs=specs,
             prices=prices,
             returns=returns,
@@ -1784,6 +1844,8 @@ class FixedIncomeEngine:
         )
         return self.bundle_
 
+    # ------------------------------------------------------------------ #
+    # SCREENING DINÁMICO Y RETORNOS PRO-FORMA
     # ------------------------------------------------------------------ #
     def _bond_specs(self) -> List[AssetSpec]:
         if self.bundle_ is None:
@@ -1819,6 +1881,7 @@ class FixedIncomeEngine:
         Sin este ajuste la covarianza reflejaría la duración que el bono tenía
         durante la ventana (mayor que la actual) y sobreestimaría su riesgo.
         """
+        # --- Curva vigente y calendario ---
         date = pd.Timestamp(date)
         out = window.copy()
         crv = self.shocks.curve_at(date)
@@ -1827,6 +1890,8 @@ class FixedIncomeEngine:
             np.diff(self.screener._years_since_as_of(levels_idx), prepend=np.nan), index=levels_idx
         )
         spreads = self.screener.spread_paths_
+
+        # --- Reemplazo de la serie de cada bono por su versión pro-forma ---
         for tk in window.columns:
             spec = self.bundle_.specs.get(tk) if self.bundle_ is not None else None
             if spec is None or spec.sub_class is not AssetSubClass.RF_BONO:
@@ -1844,6 +1909,8 @@ class FixedIncomeEngine:
         return out
 
     # ------------------------------------------------------------------ #
+    # SEÑALES TÁCTICAS (μ Y TASA LIBRE DE RIESGO)
+    # ------------------------------------------------------------------ #
     def expected_returns_at(self, date: Union[str, pd.Timestamp]) -> pd.Series:
         """
         μ analítico (YTM + roll-down) de los activos de RF modelada usando la
@@ -1855,11 +1922,11 @@ class FixedIncomeEngine:
         crv = self.shocks.curve_at(pd.Timestamp(date))
         mu: Dict[str, float] = {}
 
+        # --- Nodos TES ---
         for spec in self.node_builder.build_specs(crv):
             mu[spec.ticker] = float(spec.expected_return)
 
-        # Los bonos se evalúan con su plazo residual en `date`, no con el de la
-        # fecha de screening; los ya vencidos rinden la tasa de reinversión.
+        # --- Bonos individuales ---
         for ticker, spec in self.bundle_.specs.items():
             if spec.sub_class is not AssetSubClass.RF_BONO:
                 continue
@@ -1929,6 +1996,7 @@ class RiskMetrics:
         specs: Optional[Mapping[str, AssetSpec]] = None,
     ) -> pd.DataFrame:
         """Genera un reporte tabular de métricas de riesgo por activo."""
+        # --- Métricas por activo ---
         rows = []
         for col in returns.columns:
             spec = specs.get(col) if specs else None
@@ -1945,6 +2013,8 @@ class RiskMetrics:
                     "duracion_mod": spec.modified_duration if spec else np.nan,
                 }
             )
+
+        # --- Tabla de salida ---
         return pd.DataFrame(rows).set_index("ticker")
 
 
@@ -2011,30 +2081,31 @@ class PortfolioOptimizer:
         expected_returns: Optional[Union[pd.Series, Mapping[str, float]]] = None,
         mu_estimator: Optional[str] = None,
     ) -> None:
+        # --- Validación de entradas y estimador de μ ---
         if returns.empty:
             raise ValueError("La matriz de retornos no puede estar vacía.")
         self.mu_estimator = mu_estimator or ESTIMADOR_MU
         if self.mu_estimator not in ("bayes_stein", "muestral"):
             raise ValueError(f"mu_estimator debe ser 'bayes_stein' o 'muestral', no '{self.mu_estimator}'.")
+
+        # --- Datos base y parámetros ---
         self.returns = returns.dropna(how="any")
         self.assets = list(self.returns.columns)
         self.n = len(self.assets)
-        self.rf = rf                          # tasa E.A. (decimal), tal como se recibe
-        # μ se estima sobre retornos log, así que el Sharpe se mide contra la
-        # rf en la misma escala: rf_log = ln(1 + rf_E.A.).
+        self.rf = rf
         self.rf_log_ = float(np.log1p(rf))
         self.min_weight = min_weight
         self.trading_days = trading_days
         self.shrinkage = shrinkage
 
-        # --- límites individuales (escalar o por activo) ---
+        # --- Límites individuales (escalar o por activo) ---
         if isinstance(max_weight, Mapping):
             self.max_weights = np.array([float(max_weight.get(a, 1.0)) for a in self.assets])
         else:
             self.max_weights = np.repeat(float(max_weight), self.n)
         self.max_weight = float(np.max(self.max_weights))
 
-        # --- agrupación por clase de activo ---
+        # --- Agrupación por clase de activo ---
         self.asset_groups = dict(asset_groups) if asset_groups else {}
         self.group_constraints = [gc for gc in (group_constraints or [])]
         for gc in self.group_constraints:
@@ -2042,18 +2113,19 @@ class PortfolioOptimizer:
         self._group_index = self._build_group_index()
         self._validate_feasibility()
 
-        # --- momentos ---
+        # --- Momentos: covarianza ---
         self.cov_, self.shrinkage_intensity_ = MarketDataPipeline.covariance_matrix(
             self.returns, shrinkage=shrinkage, trading_days=trading_days
         )
         self.cov_df_ = pd.DataFrame(self.cov_, index=self.assets, columns=self.assets)
 
+        # --- Momentos: retorno esperado (μ) ---
         override = (pd.Series(expected_returns, dtype=float).reindex(self.assets).dropna()
                     if expected_returns is not None else pd.Series(dtype=float))
         self.mu_sample_series_ = pd.Series(self.returns.mean().values * trading_days,
                                            index=self.assets, name="mu_muestral")
         mu_series = self.mu_sample_series_.copy()
-        self.mu_shrinkage_: Dict[str, float] = {}   # intensidad φ de Bayes-Stein por clase
+        self.mu_shrinkage_: Dict[str, float] = {}
         if self.mu_estimator == "bayes_stein":
             mu_series = self._bayes_stein(mu_series, exclude=set(override.index))
         mu_series.update(override)
@@ -2061,6 +2133,8 @@ class PortfolioOptimizer:
         self.mu_series_ = pd.Series(self.mu_, index=self.assets, name="mu")
         self.result_: Optional[optimize.OptimizeResult] = None
 
+    # ------------------------------------------------------------------ #
+    # ESTIMADOR DE μ (BAYES-STEIN)
     # ------------------------------------------------------------------ #
     def _bayes_stein(self, mu: pd.Series, exclude: Set[str]) -> pd.Series:
         """
@@ -2078,6 +2152,7 @@ class PortfolioOptimizer:
         covarianza del optimizador (Ledoit-Wolf si está activo) por estabilidad
         numérica.
         """
+        # --- Agrupación de activos por clase ---
         out = mu.copy()
         T = len(self.returns)
         cov_daily = self.cov_ / self.trading_days
@@ -2085,6 +2160,8 @@ class PortfolioOptimizer:
         for i, a in enumerate(self.assets):
             if a not in exclude:
                 groups.setdefault(self.asset_groups.get(a, "SIN_CLASE"), []).append(i)
+
+        # --- Contracción de las medias dentro de cada clase ---
         for label, idx in groups.items():
             n = len(idx)
             if n < 3 or T <= n + 2:
@@ -2114,6 +2191,7 @@ class PortfolioOptimizer:
     # ------------------------------------------------------------------ #
     def _validate_feasibility(self) -> None:
         """Detecta bandas imposibles antes de invocar al solver."""
+        # --- Capacidad de cada banda ---
         total_min, total_max = 0.0, 0.0
         for gc in self.group_constraints:
             idx = self._group_index[gc.label]
@@ -2125,6 +2203,8 @@ class PortfolioOptimizer:
                 )
             total_min += gc.min_weight
             total_max += min(gc.max_weight, capacity)
+
+        # --- Consistencia global de las bandas ---
         if self.group_constraints:
             if total_min > 1.0 + 1e-9:
                 raise ValueError(f"Bandas infactibles: los mínimos suman {total_min:.0%} > 100%.")
@@ -2133,7 +2213,10 @@ class PortfolioOptimizer:
 
     # ------------------------------------------------------------------ #
     def _constraints(self) -> List[Dict[str, object]]:
+        # --- Presupuesto: Σ w = 1 ---
         cons: List[Dict[str, object]] = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
+
+        # --- Bandas por clase: min ≤ Σ w_g ≤ max ---
         for gc in self.group_constraints:
             idx = self._group_index[gc.label]
             if len(idx) == 0:
@@ -2143,23 +2226,27 @@ class PortfolioOptimizer:
         return cons
 
     # ------------------------------------------------------------------ #
+    # PUNTOS INICIALES FACTIBLES
+    # ------------------------------------------------------------------ #
     def _initial_weights(self) -> np.ndarray:
         """
         Punto inicial factible: presupuesto por grupo en el punto medio de su
         banda (reescalado a 1) y reparto equiponderado dentro del grupo con
         tope por activo. SLSQP converge mucho mejor desde un punto factible.
         """
+        # --- Sin bandas: reparto equiponderado con tope ---
         if not self.group_constraints:
             w = np.minimum(np.repeat(1.0 / self.n, self.n), self.max_weights)
             return w / w.sum()
 
+        # --- Presupuesto por grupo en el punto medio de su banda ---
         labels = [gc.label for gc in self.group_constraints]
         lo = np.array([gc.min_weight for gc in self.group_constraints])
         hi = np.array([min(gc.max_weight, float(self.max_weights[self._group_index[l]].sum()))
                        for gc, l in zip(self.group_constraints, labels)])
         budget = np.clip((lo + hi) / 2.0, lo, hi)
 
-        # Ajuste del residual respetando las bandas.
+        # --- Ajuste del residual respetando las bandas ---
         for _ in range(50):
             gap = 1.0 - budget.sum()
             if abs(gap) < 1e-10:
@@ -2170,6 +2257,7 @@ class PortfolioOptimizer:
                 break
             budget = budget + gap * slack / total_slack
 
+        # --- Reparto dentro de cada grupo con tope por activo ---
         w = np.zeros(self.n)
         assigned = np.zeros(self.n, dtype=bool)
         for label, b in zip(labels, budget):
@@ -2178,14 +2266,14 @@ class PortfolioOptimizer:
                 continue
             share = np.minimum(b / len(idx), self.max_weights[idx])
             deficit = b - share.sum()
-            if deficit > 1e-12:  # redistribuir lo que no cupo por el tope individual
+            if deficit > 1e-12:
                 room = self.max_weights[idx] - share
                 if room.sum() > 1e-12:
                     share = share + deficit * room / room.sum()
             w[idx] = share
             assigned[idx] = True
 
-        # Activos sin grupo restringido: reciben el remanente.
+        # --- Activos sin grupo restringido: reciben el remanente ---
         rest = np.where(~assigned)[0]
         remainder = max(1.0 - w.sum(), 0.0)
         if len(rest) and remainder > 1e-12:
@@ -2195,11 +2283,13 @@ class PortfolioOptimizer:
 
     def _random_feasible_weights(self, rng: np.random.Generator) -> np.ndarray:
         """Peso aleatorio que respeta las bandas por clase y el tope por activo."""
+        # --- Sin bandas: Dirichlet con tope ---
         if not self.group_constraints:
             w = rng.dirichlet(np.ones(self.n))
             w = np.minimum(w, self.max_weights)
             return w / w.sum()
 
+        # --- Presupuesto aleatorio por grupo dentro de su banda ---
         labels = [gc.label for gc in self.group_constraints]
         lo = np.array([gc.min_weight for gc in self.group_constraints])
         hi = np.array([gc.max_weight for gc in self.group_constraints])
@@ -2209,6 +2299,7 @@ class PortfolioOptimizer:
         budget = np.clip(budget, lo, hi)
         budget = budget / budget.sum()
 
+        # --- Reparto Dirichlet dentro de cada grupo ---
         w = np.zeros(self.n)
         for label, b in zip(labels, budget):
             idx = self._group_index[label]
@@ -2222,7 +2313,6 @@ class PortfolioOptimizer:
         total = w.sum()
         return w / total if total > 0 else np.repeat(1.0 / self.n, self.n)
 
-    # ------------------------------------------------------------------ #
     # ------------------------------------------------------------------ #
     # a) MARKOWITZ / MÁXIMO SHARPE
     # ------------------------------------------------------------------ #
@@ -2264,6 +2354,7 @@ class PortfolioOptimizer:
         reintenta desde puntos iniciales factibles aleatorios (`n_restarts`)
         antes de caer al punto medio de las bandas.
         """
+        # --- Límites, restricciones y puntos iniciales ---
         bounds = [(self.min_weight, float(mx)) for mx in self.max_weights]
         constraints = self._constraints()
         w0 = self._initial_weights()
@@ -2271,6 +2362,7 @@ class PortfolioOptimizer:
         rng = np.random.default_rng(seed)
         starts = [w0] + [self._random_feasible_weights(rng) for _ in range(max(n_restarts, 0))]
 
+        # --- Resolución con SLSQP (reinicios si no converge) ---
         best_w: Optional[np.ndarray] = None
         best_obj = np.inf
         for start in starts:
@@ -2292,8 +2384,9 @@ class PortfolioOptimizer:
             w = w / total
             if self.is_feasible(w) and result.fun < best_obj:
                 best_w, best_obj = w, float(result.fun)
-                break  # la primera solución factible ya es óptima local válida
+                break
 
+        # --- Respaldo: punto medio factible de las bandas ---
         if best_w is None:
             logger.warning(
                 "Max Sharpe: SLSQP no convergió en %d intentos. Usando el punto medio factible "
@@ -2301,8 +2394,11 @@ class PortfolioOptimizer:
             )
             best_w = w0 / w0.sum()
 
+        # --- Salida ---
         return pd.Series(best_w, index=self.assets, name="max_sharpe")
 
+    # ------------------------------------------------------------------ #
+    # DIAGNÓSTICO DE LA SOLUCIÓN
     # ------------------------------------------------------------------ #
     def group_exposure(self, weights: Union[pd.Series, np.ndarray]) -> pd.Series:
         """Exposición agregada por grupo (clase de activo) de un vector de pesos."""
@@ -2325,12 +2421,14 @@ class PortfolioOptimizer:
 
     # ------------------------------------------------------------------ #
     # VISUALIZACIONES
+    # ------------------------------------------------------------------ #
     def plot_efficient_frontier(self, n_portfolios: int = 5000, seed: int = 7) -> go.Figure:
         """
         Simula portafolios aleatorios long-only (Monte Carlo) **dentro de las
         bandas por clase de activo** para trazar la nube de riesgo-retorno y la
         frontera eficiente, superponiendo el portafolio de Máximo Sharpe.
         """
+        # --- Simulación Monte Carlo de portafolios factibles ---
         rng = np.random.default_rng(seed)
         results = np.zeros((3, n_portfolios))
         for i in range(n_portfolios):
@@ -2339,6 +2437,7 @@ class PortfolioOptimizer:
             sharpe = (ret - self.rf_log_) / vol if vol > 0 else 0.0
             results[:, i] = [ret, vol, sharpe]
 
+        # --- Nube de portafolios simulados ---
         fig = go.Figure()
         fig.add_trace(go.Scatter(
             x=results[1], y=results[0], mode="markers",
@@ -2349,6 +2448,7 @@ class PortfolioOptimizer:
             name="Portafolios simulados (dentro de bandas)", hoverinfo="skip",
         ))
 
+        # --- Portafolio de Máximo Sharpe ---
         w_opt = self.max_sharpe()
         ret, vol = self._portfolio_perf(w_opt.values)
         fig.add_trace(go.Scatter(
@@ -2356,6 +2456,7 @@ class PortfolioOptimizer:
             marker=dict(symbol="star", size=18, color="red", line=dict(width=1, color="white")),
         ))
 
+        # --- Formato ---
         bands = " | ".join(
             f"{gc.label}: {gc.min_weight:.0%}–{gc.max_weight:.0%}" for gc in self.group_constraints
         )
@@ -2371,7 +2472,6 @@ class PortfolioOptimizer:
 # 10. BACKTESTING WALK-FORWARD MULTI-ACTIVO
 # ==============================================================================
 
-# Paleta consistente por clase/sub-clase en todo el reporte.
 CLASS_COLORS: Dict[str, str] = {
     AssetClass.RENTA_VARIABLE.value: "#2E6F9E",
     AssetClass.RENTA_FIJA.value: "#C77B30",
@@ -2411,7 +2511,7 @@ class WalkForwardBacktester:
         self,
         prices: pd.DataFrame,
         lookback_days: int = 252,
-        rebalance_freq: str = "ME",   # 'ME' = fin de mes, 'W' = semanal, 'QE' = trimestral
+        rebalance_freq: str = "ME",
         rf: float = 0.0,
         max_weight: Union[float, Mapping[str, float]] = 0.30,
         shrinkage: bool = True,
@@ -2422,6 +2522,7 @@ class WalkForwardBacktester:
         exclude_fn: Optional[Callable[[pd.Timestamp], Set[str]]] = None,
         window_fn: Optional[Callable[[pd.Timestamp, pd.DataFrame], pd.DataFrame]] = None,
     ) -> None:
+        # --- Datos y parámetros del backtest ---
         self.prices = prices.dropna(how="any")
         self.returns = MarketDataPipeline.compute_returns(self.prices, method="log")
         self.lookback_days = lookback_days
@@ -2436,6 +2537,7 @@ class WalkForwardBacktester:
         self.exclude_fn = exclude_fn
         self.window_fn = window_fn
 
+        # --- Agrupación por clase y sub-clase ---
         self.asset_groups: Dict[str, str] = {
             tk: spec.asset_class.value for tk, spec in self.asset_specs.items()
         }
@@ -2443,6 +2545,7 @@ class WalkForwardBacktester:
             tk: spec.sub_class.value for tk, spec in self.asset_specs.items()
         }
 
+        # --- Resultados (se llenan en run()) ---
         self.weights_history_: Optional[pd.DataFrame] = None
         self.class_weights_history_: Optional[pd.DataFrame] = None
         self.subclass_weights_history_: Optional[pd.DataFrame] = None
@@ -2454,13 +2557,11 @@ class WalkForwardBacktester:
         self.mu_shrinkage_history_: Dict[pd.Timestamp, Dict[str, float]] = {}
 
     # ------------------------------------------------------------------ #
+    # PREPARACIÓN DE CADA REBALANCEO
+    # ------------------------------------------------------------------ #
     def _rebalance_dates(self) -> List[pd.Timestamp]:
-        # Último día con dato de cada periodo: un fin de mes de calendario que cae
-        # en fin de semana o festivo no existe en el índice, y el slicing de
-        # run() descartaría el primer día hábil siguiente.
         idx = self.returns.index
         dates = pd.Series(idx, index=idx).resample(self.rebalance_freq).last().dropna()
-        # Solo fechas con al menos `lookback_days` de historia disponible
         valid = [pd.Timestamp(d) for d in dates if (idx <= d).sum() >= self.lookback_days]
         return valid
 
@@ -2477,11 +2578,16 @@ class WalkForwardBacktester:
     def _build_optimizer(
         self, window_returns: pd.DataFrame, reb_date: pd.Timestamp
     ) -> PortfolioOptimizer:
+        # --- Bandas aplicables a las clases presentes ---
         cols = set(window_returns.columns)
         active_labels = {self.asset_groups.get(c) for c in cols}
         constraints = [gc for gc in self.group_constraints if gc.label in active_labels]
+
+        # --- μ táctico y tasa libre de riesgo a la fecha ---
         mu_override = self.expected_returns_fn(reb_date) if self.expected_returns_fn else None
         rf_t = self.rf_fn(reb_date) if self.rf_fn else self.rf
+
+        # --- Optimizador ---
         return PortfolioOptimizer(
             window_returns,
             rf=rf_t,
@@ -2512,8 +2618,11 @@ class WalkForwardBacktester:
             return pd.Series(np.repeat(1.0 / n, n), index=window_returns.columns)
 
     # ------------------------------------------------------------------ #
+    # EJECUCIÓN WALK-FORWARD
+    # ------------------------------------------------------------------ #
     def run(self) -> pd.DataFrame:
         """Ejecuta la simulación walk-forward completa y retorna el historial de pesos."""
+        # --- Fechas de rebalanceo ---
         rebal_dates = self._rebalance_dates()
         if len(rebal_dates) < 2:
             raise RuntimeError(
@@ -2521,17 +2630,21 @@ class WalkForwardBacktester:
                 "reduzca lookback_days o amplíe el rango de fechas."
             )
 
+        # --- Acumuladores ---
         weight_records: Dict[pd.Timestamp, pd.Series] = {}
         rf_records: Dict[pd.Timestamp, float] = {}
         daily_portfolio_returns: List[pd.Series] = []
 
         self.excluded_history_ = {}
         self.mu_shrinkage_history_ = {}
+
+        # --- Bucle walk-forward ---
         for i, reb_date in enumerate(rebal_dates):
+            # --- Estimación dentro de muestra y optimización ---
             in_sample = self._in_sample(reb_date)
             try:
                 w, rf_t = self._optimize_weights(in_sample, reb_date)
-            except Exception as exc:  # robustez ante ventanas degeneradas
+            except Exception as exc:
                 logger.warning("Optimización falló en %s (%s). Usando pesos factibles de banda.",
                                reb_date.date(), exc)
                 w = self._fallback_weights(in_sample, reb_date)
@@ -2540,15 +2653,15 @@ class WalkForwardBacktester:
             weight_records[reb_date] = w
             rf_records[reb_date] = rf_t
 
+            # --- Aplicación de los pesos fuera de muestra ---
             next_date = rebal_dates[i + 1] if i + 1 < len(rebal_dates) else self.returns.index[-1]
-            out_of_sample = self.returns.loc[reb_date:next_date].iloc[1:]  # excluye el día de rebalanceo
+            out_of_sample = self.returns.loc[reb_date:next_date].iloc[1:]
             if not out_of_sample.empty:
-                # Los retornos log no son aditivos entre activos: se agrega en
-                # retornos simples y se vuelve a escala log para la serie.
                 simple_ret = np.expm1(out_of_sample[w.index]) @ w.values
                 daily_portfolio_returns.append(np.log1p(simple_ret))
 
-        self.weights_history_ = pd.DataFrame(weight_records).T.fillna(0.0)
+        # --- Consolidación de resultados ---
+        self.weights_history_ =pd.DataFrame(weight_records).T.fillna(0.0)
         self.rf_used_ = pd.Series(rf_records, name="rf")
         self.portfolio_returns_ = pd.concat(daily_portfolio_returns).sort_index()
         self.equity_curve_ = np.exp(self.portfolio_returns_.cumsum())
@@ -2569,10 +2682,13 @@ class WalkForwardBacktester:
         self.rf_weights_history_ = wh[rf_cols]
 
     # ------------------------------------------------------------------ #
+    # MÉTRICAS DE DESEMPEÑO
+    # ------------------------------------------------------------------ #
     def performance_summary(self) -> Dict[str, float]:
         """Resumen de desempeño del backtest fuera de muestra."""
         if self.portfolio_returns_ is None:
             raise RuntimeError("Ejecute run() antes de solicitar el resumen de desempeño.")
+        # --- Métricas de desempeño ---
         r = self.portfolio_returns_
         summary = {
             "retorno_total": float(self.equity_curve_.iloc[-1] - 1),
@@ -2582,9 +2698,13 @@ class WalkForwardBacktester:
             "max_drawdown": RiskMetrics.max_drawdown(self.equity_curve_),
             "num_rebalanceos": float(self.weights_history_.shape[0]),
         }
+
+        # --- Peso medio por clase ---
         if self.class_weights_history_ is not None:
             for cls_label, serie in self.class_weights_history_.items():
                 summary[f"peso_medio_{cls_label}"] = float(serie.mean())
+
+        # --- Intensidad media del shrinkage de μ ---
         if self.mu_shrinkage_history_:
             phi = pd.DataFrame(self.mu_shrinkage_history_).T
             for cls_label, serie in phi.items():
@@ -2637,6 +2757,8 @@ class WalkForwardBacktester:
         wh = self.weights_history_
         ordered = sorted(wh.columns, key=lambda c: (self.asset_groups.get(c, "Z"),
                                                     self.asset_subgroups.get(c, "Z"), c))
+
+        # --- Áreas apiladas por activo ---
         fig = go.Figure()
         for col in ordered:
             sub = self.asset_subgroups.get(col, "SIN_CLASE")
@@ -2660,6 +2782,7 @@ class WalkForwardBacktester:
         """
         if self.class_weights_history_ is None:
             raise RuntimeError("Ejecute run() antes de graficar.")
+        # --- Áreas apiladas por clase ---
         cw = self.class_weights_history_
         fig = go.Figure()
         for cls_label in [c for c in [AssetClass.RENTA_FIJA.value, AssetClass.RENTA_VARIABLE.value]
@@ -2670,6 +2793,8 @@ class WalkForwardBacktester:
                 fillcolor=CLASS_COLORS.get(cls_label),
                 hovertemplate=f"<b>Total {cls_label}</b><br>%{{x|%Y-%m}}: %{{y:.2f}}%<extra></extra>",
             ))
+
+        # --- Bandas de política superpuestas ---
         for gc in self.group_constraints:
             if gc.label not in cw.columns:
                 continue
@@ -2692,6 +2817,8 @@ class WalkForwardBacktester:
         """
         if self.subclass_weights_history_ is None:
             raise RuntimeError("Ejecute run() antes de graficar.")
+
+        # --- Datos de las sub-clases de RF (opcionalmente normalizados) ---
         rf_subs = [s.value for s in (AssetSubClass.RF_NODO_TES, AssetSubClass.RF_ETF, AssetSubClass.RF_BONO)]
         cols = [c for c in rf_subs if c in self.subclass_weights_history_.columns]
         data = self.subclass_weights_history_[cols]
@@ -2699,6 +2826,7 @@ class WalkForwardBacktester:
             total = data.sum(axis=1).replace(0.0, np.nan)
             data = data.div(total, axis=0).fillna(0.0)
 
+        # --- Barras apiladas ---
         fig = go.Figure()
         for col in cols:
             fig.add_trace(go.Bar(
@@ -2719,8 +2847,11 @@ class WalkForwardBacktester:
         """Detalle título a título de la pata de Renta Fija."""
         if self.rf_weights_history_ is None:
             raise RuntimeError("Ejecute run() antes de graficar.")
+        # --- Orden por sub-clase ---
         rfw = self.rf_weights_history_
         ordered = sorted(rfw.columns, key=lambda c: (self.asset_subgroups.get(c, "Z"), c))
+
+        # --- Áreas apiladas por instrumento ---
         fig = go.Figure()
         for col in ordered:
             sub = self.asset_subgroups.get(col, "SIN_CLASE")
@@ -2755,15 +2886,13 @@ class AllocationPolicy:
     banda_rv: Tuple[float, float] = field(default_factory=lambda: BANDA_RV)
     banda_rf: Tuple[float, float] = field(default_factory=lambda: BANDA_RF)
 
-    # Topes por instrumento: una acción individual no soporta el mismo peso que
-    # un vehículo diversificado, ni un bono el de un nodo de curva.
     max_peso_accion: float = field(default_factory=lambda: MAX_PESO_ACCION_INDIVIDUAL)
     max_peso_etf_rv: float = field(default_factory=lambda: MAX_PESO_ETF_RV)
     max_peso_etf_rf: float = field(default_factory=lambda: MAX_PESO_ETF_RF)
     max_peso_nodo_tes: float = field(default_factory=lambda: MAX_PESO_NODO_TES)
     max_peso_bono: float = field(default_factory=lambda: MAX_PESO_BONO_INDIVIDUAL)
 
-    rf_tenor_years: float = field(default_factory=lambda: RF_TENOR_YEARS)  # plazo usado como rf
+    rf_tenor_years: float = field(default_factory=lambda: RF_TENOR_YEARS)
 
     # ------------------------------------------------------------------ #
     def group_constraints(self) -> List[GroupConstraint]:
@@ -2793,6 +2922,7 @@ class AllocationPolicy:
         Comprueba que cada banda sea alcanzable con los topes vigentes antes de
         llegar al solver, y avisa si el mínimo exige concentrar el universo.
         """
+        # --- Capacidad de cada clase frente a su banda ---
         caps = self.max_weights(specs)
         for cls, (lo, hi) in ((AssetClass.RENTA_VARIABLE, self.banda_rv),
                               (AssetClass.RENTA_FIJA, self.banda_rf)):
@@ -2868,6 +2998,7 @@ class InteractiveReport:
 
     # ------------------------------------------------------------------ #
     def write(self, path: str) -> str:
+        # --- Ensamble del documento HTML ---
         html = (
             "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             f"<title>{self.title}</title><style>{self._CSS}</style></head><body>"
@@ -2875,6 +3006,8 @@ class InteractiveReport:
             + "\n".join(self._blocks)
             + "</body></html>"
         )
+
+        # --- Escritura a disco ---
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
         return path
@@ -2898,6 +3031,7 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     # 1) PRECIOS DE MERCADO (RV + ETFs de RF — Enfoque B)
     # ---------------------------------------------------------------- #
+    # --- Descarga de precios y retornos ---
     logger.info("Descargando/generando precios para %d tickers de mercado.", len(universe.all_tickers))
     pipeline = MarketDataPipeline(
         universe.all_tickers + [universe.benchmark], start_date, end_date, seed=SEMILLA_ALEATORIA
@@ -2906,15 +3040,7 @@ def main() -> None:
     returns = pipeline.compute_returns(prices, method="log")
     logger.info("Precios obtenidos: %d filas x %d activos.", *prices.shape)
 
-    # Universo invertible: se descartan los tickers con historia real más corta
-    # que start_date, porque un dropna(how="any") conjunto colapsaría la ventana
-    # común de todo el portafolio a la fecha del activo más joven. Con
-    # EXCLUIR_ACTIVOS_SIN_PRECIO_REAL se descartan además los que sólo tienen
-    # serie simulada: un activo inventado no debe competir por peso contra
-    # activos con historia real (puede salir con un Sharpe alto por azar).
-    # También se exige dato hasta el final de la ventana (un título que dejó de
-    # cotizar queda con precio plano) y negociación suficiente (ver
-    # MAX_PCT_DIAS_SIN_MOVIMIENTO / MAX_DIAS_PRECIO_CONGELADO).
+    # --- Filtros de cobertura, historia y liquidez ---
     holgura = pd.Timedelta(days=HOLGURA_COBERTURA_DIAS)
     min_start_buffer = pd.Timestamp(start_date) + holgura
     max_end_buffer = pd.Timestamp(end_date) - holgura
@@ -2936,6 +3062,7 @@ def main() -> None:
                 motivos_exclusion[tk] = (f"ilíquido: precio congelado {liq['racha_precio_congelado']} "
                                          f"días seguidos (máx. {MAX_DIAS_PRECIO_CONGELADO})")
 
+    # --- Selección del universo final (datos reales vs. modo demostración) ---
     def _con_historia(tickers: Sequence[str]) -> List[str]:
         return [tk for tk in tickers if tk not in motivos_exclusion]
 
@@ -2944,8 +3071,6 @@ def main() -> None:
     modo_demo = len(rv_reales) < MIN_ACTIVOS_RV_REALES
 
     if modo_demo:
-        # Sin red o sin cobertura de la API: se conservan las series sintéticas
-        # para que el motor completo siga siendo ejecutable de extremo a extremo.
         rv_tickers = rv_con_historia
         rf_etf_tickers = _con_historia(universe.rf_etf_tickers)
         logger.warning(
@@ -2963,6 +3088,7 @@ def main() -> None:
         rv_tickers = rv_con_historia
         rf_etf_tickers = _con_historia(universe.rf_etf_tickers)
 
+    # --- Registro de los activos descartados ---
     descartados = sorted(
         (set(universe.rv_tickers) | set(universe.rf_etf_tickers))
         - set(rv_tickers) - set(rf_etf_tickers)
@@ -2982,9 +3108,8 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     logger.info("-" * 78)
     logger.info("CURVA TES — TASA LIBRE DE RIESGO Y NODOS DE DURACIÓN")
-    # Histórico real de la curva (Banrep) completado a todos los plazos con
-    # Nelson-Siegel. La curva base —con la que se hace el screening inicial y
-    # se definen los nodos— es la vigente al inicio de la ventana.
+
+    # --- Histórico diario de la curva (Banrep) ---
     curve_history: Optional[pd.DataFrame] = None
     plazos_curva = sorted(set(float(t) for t in CURVA_TES_PLAZOS) | set(float(t) for t in universe.nodos_tes))
     if CURVA_TES_FUENTE == "banrep":
@@ -3001,8 +3126,9 @@ def main() -> None:
     elif CURVA_TES_FUENTE != "simulada":
         raise ValueError(f"CURVA_TES_FUENTE debe ser 'banrep' o 'simulada', no '{CURVA_TES_FUENTE}'.")
 
+    # --- Curva base al inicio de la ventana ---
     if curve_history is not None:
-        fila_inicio = curve_history.loc[:start_date]
+        fila_inicio =curve_history.loc[:start_date]
         fila_inicio = fila_inicio.iloc[-1] if not fila_inicio.empty else curve_history.iloc[0]
         curve = TESYieldCurve.from_levels(plazos_curva, fila_inicio.values)
         logger.info("Curva TES: histórico real de Banrep (1, 5 y 10 años, completado con Nelson-Siegel "
@@ -3016,7 +3142,9 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     logger.info("-" * 78)
     logger.info("RENTA FIJA — NODOS TES (A) + ETFs/FICs (B) + BONOS FILTRADOS (C)")
-    criteria = BondScreeningCriteria()   # se configura en la cabecera del archivo
+
+    # --- Construcción del motor de renta fija ---
+    criteria = BondScreeningCriteria()
     fi_engine = FixedIncomeEngine(
         curve=curve,
         node_tenors=universe.nodos_tes,
@@ -3029,11 +3157,7 @@ def main() -> None:
         curve_history=curve_history,
     )
 
-    # La tasa libre de riesgo se lee de la curva TES al plazo del horizonte de
-    # inversión, en vez de fijarse a dedo: la curva colombiana no es plana y
-    # `rf` entra directamente en el Sharpe que optimizamos. Con curva histórica
-    # varía en el tiempo: el portafolio estratégico usa la del cierre y las
-    # métricas históricas por activo, el promedio de la ventana.
+    # --- Tasa libre de riesgo ---
     rf_serie = fi_engine.shocks.levels_at([policy.rf_tenor_years]).iloc[:, 0]
     rf_tes = float(rf_serie.iloc[-1])
     rf_medio = float(rf_serie.mean())
@@ -3041,6 +3165,8 @@ def main() -> None:
         "Tasa libre de riesgo: TES a %.2g año(s) = %.4f%% E.A. al cierre (%.4f%% al inicio, "
         "%.4f%% en promedio)", policy.rf_tenor_years, rf_tes * 100, rf_serie.iloc[0] * 100, rf_medio * 100,
     )
+
+    # --- Salida en consola: screening y analítica de RF ---
     print("\n--- Screening de bonos individuales (Enfoque C) ---")
     print(fi_bundle.screening_report[
         ["emisor", "rating", "plazo_anios", "ytm", "duracion_mod", "spread_bp", "aprobado", "motivo_rechazo"]
@@ -3051,12 +3177,14 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     # 4) MATRIZ UNIFICADA MULTI-ACTIVO
     # ---------------------------------------------------------------- #
+    # --- Fichas de todos los activos (mercado + RF modelada) ---
     specs: Dict[str, AssetSpec] = {}
     market_specs = universe.market_specs()
     for tk in rv_tickers + rf_etf_tickers:
         specs[tk] = market_specs[tk]
     specs.update(fi_bundle.specs)
 
+    # --- Precios y retornos unificados ---
     multi_prices = MarketDataPipeline.build_multi_asset_prices(
         prices[rv_tickers + rf_etf_tickers], fi_bundle.prices
     )
@@ -3073,6 +3201,8 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     logger.info("-" * 78)
     logger.info("MÉTRICAS DE RIESGO MICRO POR ACTIVO")
+
+    # --- Reporte de riesgo por activo ---
     risk_report = RiskMetrics.asset_risk_report(
         pd.concat([prices, fi_bundle.prices], axis=1, sort=True).ffill(),
         pd.concat([multi_returns, returns[[universe.benchmark]]], axis=1, sort=True).dropna(how="any"),
@@ -3087,14 +3217,11 @@ def main() -> None:
     logger.info("OPTIMIZACIÓN MULTI-ACTIVO — MÁXIMO SHARPE CON BANDAS (%s)", policy.describe())
     policy.validate(specs)
 
-    # μ analítico de la RF: YTM + roll-down de la curva vigente al cierre.
-    # Se convierte a escala logarítmica porque la matriz de momentos se estima
-    # sobre retornos log: μ_log = ln(1 + μ_efectiva).
+    # --- μ analítico de la RF al cierre ---
     fecha_cierre = multi_returns.index[-1]
     mu_rf_hoy = np.log1p(fi_engine.expected_returns_at(fecha_cierre))
 
-    # Screening al cierre: sólo los bonos elegibles hoy, con retornos
-    # pro-forma (choques históricos aplicados a su plazo y duración actuales).
+    # --- Screening de bonos al cierre y retornos pro-forma ---
     bonos_no_elegibles = fi_engine.excluded_bonds_at(fecha_cierre)
     if bonos_no_elegibles:
         logger.info("Bonos no elegibles al %s (plazo, spread o emisor): %s",
@@ -3104,6 +3231,7 @@ def main() -> None:
         multi_returns.drop(columns=sorted(bonos_no_elegibles & set(multi_returns.columns))),
     )
 
+    # --- Optimización de Máximo Sharpe ---
     optimizer = PortfolioOptimizer(
         retornos_estrategicos,
         rf=rf_tes,
@@ -3116,6 +3244,7 @@ def main() -> None:
     weights_opt = optimizer.max_sharpe()
     ret_opt, vol_opt = optimizer._portfolio_perf(weights_opt.values)
 
+    # --- Tabla de pesos y cumplimiento de bandas ---
     tabla_pesos = pd.DataFrame({
         "peso_%": (weights_opt * 100).round(2),
         "clase": [specs[t].asset_class.value for t in weights_opt.index],
@@ -3128,6 +3257,7 @@ def main() -> None:
     print("\n--- Cumplimiento de bandas ---")
     print(optimizer.constraints_check(weights_opt).to_string())
 
+    # --- Diagnóstico de shrinkage y métricas del óptimo ---
     logger.info(
         "Intensidad de shrinkage Ledoit-Wolf: δ = %.4f (0 = covarianza muestral pura, 1 = target)",
         optimizer.shrinkage_intensity_,
@@ -3145,6 +3275,8 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     logger.info("-" * 78)
     logger.info("BACKTEST WALK-FORWARD FUERA DE MUESTRA CON BANDAS RV/RF")
+
+    # --- Configuración y ejecución del backtest ---
     backtester = WalkForwardBacktester(
         multi_prices,
         lookback_days=LOOKBACK_DIAS,
@@ -3154,18 +3286,16 @@ def main() -> None:
         shrinkage=USAR_SHRINKAGE_LEDOIT_WOLF,
         asset_specs=specs,
         group_constraints=policy.group_constraints(),
-        # μ táctico de la RF: se releen YTM y roll-down de la curva vigente en
-        # cada fecha de rebalanceo (la RV sigue usando su media muestral).
         expected_returns_fn=lambda d: np.log1p(fi_engine.expected_returns_at(d)),
         rf_fn=lambda d: fi_engine.risk_free_at(d, policy.rf_tenor_years),
-        # Screening dinámico de bonos y covarianza con retornos pro-forma.
         exclude_fn=fi_engine.excluded_bonds_at,
         window_fn=fi_engine.proforma_log_returns,
     )
     weights_history = backtester.run()
     perf_summary = backtester.performance_summary()
 
-    bonos = [tk for tk, sp in specs.items() if sp.sub_class is AssetSubClass.RF_BONO]
+    # --- Elegibilidad de bonos a lo largo del backtest ---
+    bonos =[tk for tk, sp in specs.items() if sp.sub_class is AssetSubClass.RF_BONO]
     elegibles = pd.DataFrame({
         d: {tk: tk not in excl for tk in bonos} for d, excl in backtester.excluded_history_.items()
     }).T
@@ -3181,6 +3311,7 @@ def main() -> None:
         },
     })
 
+    # --- Salida en consola del backtest ---
     print("\n--- Asignación por clase de activo en cada rebalanceo (%) ---")
     print((backtester.class_weights_history_ * 100).round(2).to_string())
     print("\n--- Composición interna de la Renta Fija (%) ---")
@@ -3198,6 +3329,8 @@ def main() -> None:
     # ---------------------------------------------------------------- #
     # 8) REPORTE HTML INTERACTIVO
     # ---------------------------------------------------------------- #
+
+    # --- Cabecera y notas metodológicas ---
     report = InteractiveReport(
         "Quant PM — Motor de Asset Allocation Multi-Activo (RV + RF)",
         f"Universo: {n_rv} activos de Renta Variable y {n_rf} de Renta Fija | "
@@ -3238,6 +3371,8 @@ def main() -> None:
             + ". El motor no sustituye precios faltantes por series simuladas dentro del optimizador, "
             "ni admite títulos cuyo precio congelado haría parecer su riesgo menor al real."
         )
+
+    # --- Sección: curva TES y renta fija ---
     curva_cierre = fi_engine.shocks.curve_at(multi_returns.index[-1])
     report.add_chart(f"Curva TES — Estructura Temporal (ETTI) al {multi_returns.index[-1].date()}",
                      curva_cierre.plot_curve())
@@ -3258,11 +3393,15 @@ def main() -> None:
         "Screening dinámico — elegibilidad de cada bono en los rebalanceos",
         tabla_elegibilidad, "{:.2f}",
     )
+
+    # --- Sección: optimización estratégica ---
     report.add_chart("Frontera Eficiente Multi-Activo", optimizer.plot_efficient_frontier(n_portfolios=3000))
     report.add_table("Portafolio estratégico óptimo (peso > 0.01%)",
                      tabla_pesos[tabla_pesos["peso_%"] > 0.01], "{:.2f}")
     report.add_table("Cumplimiento de bandas — portafolio estratégico",
                      optimizer.constraints_check(weights_opt), "{:.4f}")
+
+    # --- Sección: backtest walk-forward ---
     report.add_chart("Asignación Estratégica: Total RF vs Total RV",
                      backtester.plot_asset_class_evolution())
     report.add_chart("Composición Interna de la Renta Fija (Nodos TES / ETFs / Bonos)",
@@ -3273,6 +3412,8 @@ def main() -> None:
     report.add_chart("Evolución de Pesos por Activo", backtester.plot_weights_evolution())
     report.add_chart("Curva de Equity — Backtest Walk-Forward", backtester.plot_equity_curve())
     report.add_table("Desempeño fuera de muestra", pd.DataFrame(perf_summary, index=["valor"]).T)
+
+    # --- Sección: riesgo micro y liquidez ---
     report.add_table("Métricas de riesgo micro por activo", risk_report)
     if not liquidez.empty:
         tabla_liquidez = liquidez.assign(
@@ -3282,6 +3423,7 @@ def main() -> None:
         ).sort_values("pct_sin_movimiento", ascending=False)
         report.add_table("Liquidez y cobertura de precios por ticker", tabla_liquidez, "{:.3f}")
 
+    # --- Escritura del reporte ---
     report_path = report.write(os.path.join(DIRECTORIO_SALIDA, "reporte_interactivo.html"))
 
     logger.info("=" * 78)
