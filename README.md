@@ -31,12 +31,14 @@ The script runs from `main()` in eight steps.
 ### 1. Market data and universe selection (`MarketDataPipeline`)
 - Downloads daily adjusted close prices from **Yahoo Finance** (`yfinance`) for 2021-01-01 to 2024-12-31.
 - If a ticker fails to download, it generates a **synthetic series** (geometric Brownian motion with a common market factor plus an idiosyncratic shock). The seed is stable per ticker (CRC32), so runs are reproducible.
-- When calendars are aligned, a missing price is carried forward for **at most 5 days**. A security that stops trading shows up as missing data instead of a flat price.
-- A ticker is **excluded** from the optimization and the backtest when any of these holds:
-  - its real history starts more than 45 days after the start date, or ends more than 45 days before the end date;
-  - it only has a synthetic series (`EXCLUIR_ACTIVOS_SIN_PRECIO_REAL`);
-  - it is **illiquid**: more than 25% of its days have exactly zero return, or its price stays frozen for more than 30 days in a row. This is measured on the ticker's own calendar. Stale prices understate volatility and correlation, and a Sharpe optimizer rewards exactly that.
-- Every exclusion is logged with its reason and listed in the HTML report.
+- When calendars are aligned, a missing price is carried forward for **at most 5 days**. A security listed after the start date stays as missing data before its first price, without truncating the matrix.
+- A ticker with only a synthetic series is excluded from the whole run (`EXCLUIR_ACTIVOS_SIN_PRECIO_REAL`).
+- Every other filter is evaluated **at each rebalance, using only the prices in that rebalance's estimation window** (`LOOKBACK_DIAS`). The full sample is never used, because that would tell the 2022 backtest which stocks later become illiquid or stop trading (look-ahead bias). A ticker is not investable on a date when any of these holds:
+  - its history does not cover the estimation window;
+  - it has no quote in the last 5 business days;
+  - it is **illiquid** within the window: more than 25% of its days have exactly zero return, or its price stays frozen for more than 30 days in a row. This is measured on the ticker's own calendar. Stale prices understate volatility and correlation, and a Sharpe optimizer rewards exactly that.
+- The strategic portfolio applies the same filters at the closing date, over its own estimation window.
+- Exclusions at the closing date are logged with their reason. The HTML report lists, per ticker, how many rebalances it was eligible for and its most frequent exclusion reason.
 - If fewer than 5 equities with real prices remain (for example, with no network access), the engine switches to a **demo mode** on the synthetic series and says so in the log.
 
 ### 2. TES yield curve (`TESYieldCurve`)

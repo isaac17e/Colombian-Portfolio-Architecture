@@ -13,7 +13,7 @@ import zlib
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
 
 # --- Cómputo numérico y estadístico ------------------------------------------
 import numpy as np
@@ -417,14 +417,66 @@ class MarketDataPipeline:
         """
         rows: Dict[str, Dict[str, object]] = {}
         for tk, s in self.raw_prices_.items():
-            r = np.log(s / s.shift(1)).dropna()
             rows[tk] = {
-                "pct_sin_movimiento": float((r.abs() < 1e-12).mean()) if len(r) else float("nan"),
-                "racha_precio_congelado": int(s.ne(s.shift(1)).cumsum().value_counts().max()),
+                **self._liquidity_stats(s),
                 "primer_dato": s.index[0],
                 "ultimo_dato": s.index[-1],
             }
         return pd.DataFrame.from_dict(rows, orient="index")
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _liquidity_stats(s: pd.Series) -> Dict[str, float]:
+        """% de días con retorno exactamente cero y racha máxima de precio congelado."""
+        r = np.log(s / s.shift(1)).dropna()
+        return {
+            "pct_sin_movimiento": float((r.abs() < 1e-12).mean()) if len(r) else float("nan"),
+            "racha_precio_congelado": int(s.ne(s.shift(1)).cumsum().value_counts().max()) if len(s) else 0,
+        }
+
+    # ------------------------------------------------------------------ #
+    def tradability_issues_at(
+        self,
+        date: Union[str, pd.Timestamp],
+        window_start: Union[str, pd.Timestamp],
+        tickers: Sequence[str],
+    ) -> Dict[str, str]:
+        """
+        Motivo por el que cada ticker NO es invertible en `date`, usando sólo
+        los precios observados en [window_start, date] — la ventana de
+        estimación del optimizador. Evaluar los filtros con toda la muestra
+        haría que el backtest supiera en 2022 qué títulos se volverían
+        ilíquidos o dejarían de cotizar después (sesgo de look-ahead).
+
+        Los tickers sin precio real (serie sintética) no se evalúan aquí: su
+        exclusión no depende de la fecha y se decide al armar el universo.
+        """
+        date, window_start = pd.Timestamp(date), pd.Timestamp(window_start)
+        max_gap = self.max_fill_days if self.max_fill_days is not None else MAX_DIAS_RELLENO_PRECIO
+        issues: Dict[str, str] = {}
+        for tk in tickers:
+            s = self.raw_prices_.get(tk)
+            if s is None:
+                continue
+            s = s.loc[:date]
+
+            # --- Cobertura: historia completa y cotización reciente ---
+            if s.empty or s.index[0] > window_start:
+                issues[tk] = "historia más corta que la ventana de estimación"
+                continue
+            if len(pd.bdate_range(s.index[-1], date)) - 1 > max_gap:
+                issues[tk] = f"sin cotización desde {s.index[-1].date()}"
+                continue
+
+            # --- Liquidez dentro de la ventana ---
+            liq = self._liquidity_stats(s.loc[window_start:])
+            if liq["pct_sin_movimiento"] > MAX_PCT_DIAS_SIN_MOVIMIENTO:
+                issues[tk] = (f"ilíquido: {liq['pct_sin_movimiento']:.0%} de días sin movimiento "
+                              f"(máx. {MAX_PCT_DIAS_SIN_MOVIMIENTO:.0%})")
+            elif liq["racha_precio_congelado"] > MAX_DIAS_PRECIO_CONGELADO:
+                issues[tk] = (f"ilíquido: precio congelado {liq['racha_precio_congelado']} días "
+                              f"seguidos (máx. {MAX_DIAS_PRECIO_CONGELADO})")
+        return issues
 
     # ------------------------------------------------------------------ #
     # TRANSFORMACIONES Y ENSAMBLE DE LA MATRIZ
@@ -460,20 +512,26 @@ class MarketDataPipeline:
 
     # ------------------------------------------------------------------ #
     @staticmethod
-    def build_multi_asset_prices(*blocks: Optional[pd.DataFrame]) -> pd.DataFrame:
+    def build_multi_asset_prices(
+        *blocks: Optional[pd.DataFrame], late_start: Iterable[str] = ()
+    ) -> pd.DataFrame:
         """
         Ensambla la matriz unificada de precios RV + RF alineando por fecha.
 
         Se conserva únicamente la intersección de fechas con dato en todos los
         bloques (tras `ffill`), que es la ventana sobre la que la covarianza
-        conjunta es estimable sin imputaciones agresivas.
+        conjunta es estimable sin imputaciones agresivas. Los tickers de
+        `late_start` (listados después del inicio) quedan en NaN antes de su
+        primer precio sin recortar la matriz; cada rebalanceo decide si su
+        historia cubre ya la ventana de estimación.
         """
         valid = [b for b in blocks if b is not None and not b.empty]
         if not valid:
             raise ValueError("No hay bloques de precios para ensamblar.")
         merged = pd.concat(valid, axis=1, sort=True)
-        merged = merged.loc[:, ~merged.columns.duplicated()]
-        return merged.ffill().dropna(how="any")
+        merged = merged.loc[:, ~merged.columns.duplicated()].ffill()
+        late = set(late_start)
+        return merged.dropna(subset=[c for c in merged.columns if c not in late], how="any")
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -2001,16 +2059,17 @@ class RiskMetrics:
         rows = []
         for col in returns.columns:
             spec = specs.get(col) if specs else None
+            r = returns[col].dropna()
             rows.append(
                 {
                     "ticker": col,
                     "clase": spec.asset_class.value if spec else "",
                     "sub_clase": spec.sub_class.value if spec else "",
-                    "vol_anualizada": cls.annualized_volatility(returns[col]),
-                    "retorno_anualizado": cls.annualized_return(returns[col]),
-                    "beta": cls.beta(returns[col], returns[market_col]) if market_col in returns else np.nan,
+                    "vol_anualizada": cls.annualized_volatility(r),
+                    "retorno_anualizado": cls.annualized_return(r),
+                    "beta": cls.beta(r, returns[market_col]) if market_col in returns else np.nan,
                     "max_drawdown": cls.max_drawdown(prices[col]) if col in prices else np.nan,
-                    "sharpe": cls.sharpe_ratio(returns[col], rf),
+                    "sharpe": cls.sharpe_ratio(r, rf),
                     "duracion_mod": spec.modified_duration if spec else np.nan,
                 }
             )
@@ -2501,9 +2560,11 @@ class WalkForwardBacktester:
     TES vigente en ese momento — así como una tasa libre de riesgo variable
     (`rf_fn`).
 
-    El universo invertible también puede variar por fecha: `exclude_fn(fecha)`
-    devuelve los activos que no son elegibles en ese rebalanceo (p. ej. bonos
-    fuera de la banda de plazo o vencidos) y `window_fn(fecha, ventana)`
+    El universo invertible también puede variar por fecha:
+    `exclude_fn(fecha, inicio_ventana)` devuelve los activos que no son
+    elegibles en ese rebalanceo (p. ej. bonos fuera de la banda de plazo o
+    acciones ilíquidas en la ventana), un activo sin historia completa en la
+    ventana se descarta siempre, y `window_fn(fecha, ventana)`
     permite ajustar la ventana de estimación (p. ej. retornos pro-forma de los
     bonos con sus características vigentes).
     """
@@ -2520,11 +2581,11 @@ class WalkForwardBacktester:
         group_constraints: Optional[Sequence[GroupConstraint]] = None,
         expected_returns_fn: Optional[Callable[[pd.Timestamp], pd.Series]] = None,
         rf_fn: Optional[Callable[[pd.Timestamp], float]] = None,
-        exclude_fn: Optional[Callable[[pd.Timestamp], Set[str]]] = None,
+        exclude_fn: Optional[Callable[[pd.Timestamp, pd.Timestamp], Set[str]]] = None,
         window_fn: Optional[Callable[[pd.Timestamp, pd.DataFrame], pd.DataFrame]] = None,
     ) -> None:
         # --- Datos y parámetros del backtest ---
-        self.prices = prices.dropna(how="any")
+        self.prices = prices.dropna(how="all")
         self.returns = MarketDataPipeline.compute_returns(self.prices, method="log")
         self.lookback_days = lookback_days
         self.rebalance_freq = rebalance_freq
@@ -2570,7 +2631,8 @@ class WalkForwardBacktester:
     def _in_sample(self, reb_date: pd.Timestamp) -> pd.DataFrame:
         """Ventana de estimación con sólo los activos invertibles en `reb_date`."""
         window = self.returns.loc[:reb_date].tail(self.lookback_days)
-        excluded = set(self.exclude_fn(reb_date)) if self.exclude_fn else set()
+        excluded = set(self.exclude_fn(reb_date, window.index[0])) if self.exclude_fn else set()
+        excluded |= set(window.columns[window.isna().any()])
         self.excluded_history_[reb_date] = excluded & set(window.columns)
         window = window.drop(columns=sorted(self.excluded_history_[reb_date]))
         return self.window_fn(reb_date, window) if self.window_fn else window
@@ -3041,66 +3103,39 @@ def main() -> None:
     returns = pipeline.compute_returns(prices, method="log")
     logger.info("Precios obtenidos: %d filas x %d activos.", *prices.shape)
 
-    # --- Filtros de cobertura, historia y liquidez ---
-    holgura = pd.Timedelta(days=HOLGURA_COBERTURA_DIAS)
-    min_start_buffer = pd.Timestamp(start_date) + holgura
-    max_end_buffer = pd.Timestamp(end_date) - holgura
+    # --- Selección del universo (datos reales vs. modo demostración) ---
+    # Sólo se decide aquí lo que no depende de la fecha: tener precio real. La
+    # historia, la cotización reciente y la liquidez se evalúan en cada
+    # rebalanceo con la ventana de estimación (`tradability_issues_at`).
+    def _reales(tickers: Sequence[str]) -> List[str]:
+        return [tk for tk in tickers if tk not in pipeline.synthetic_tickers_]
 
-    liquidez = pipeline.liquidity_report()
-    motivos_exclusion: Dict[str, str] = {}
-    for tk in universe.all_tickers:
-        first, last = prices[tk].first_valid_index(), prices[tk].last_valid_index()
-        if first is None or first > min_start_buffer:
-            motivos_exclusion[tk] = "historia más corta que la ventana"
-        elif last < max_end_buffer:
-            motivos_exclusion[tk] = f"sin cotización desde {last.date()}"
-        elif tk in liquidez.index:
-            liq = liquidez.loc[tk]
-            if liq["pct_sin_movimiento"] > MAX_PCT_DIAS_SIN_MOVIMIENTO:
-                motivos_exclusion[tk] = (f"ilíquido: {liq['pct_sin_movimiento']:.0%} de días sin "
-                                         f"movimiento (máx. {MAX_PCT_DIAS_SIN_MOVIMIENTO:.0%})")
-            elif liq["racha_precio_congelado"] > MAX_DIAS_PRECIO_CONGELADO:
-                motivos_exclusion[tk] = (f"ilíquido: precio congelado {liq['racha_precio_congelado']} "
-                                         f"días seguidos (máx. {MAX_DIAS_PRECIO_CONGELADO})")
-
-    # --- Selección del universo final (datos reales vs. modo demostración) ---
-    def _con_historia(tickers: Sequence[str]) -> List[str]:
-        return [tk for tk in tickers if tk not in motivos_exclusion]
-
-    rv_con_historia = _con_historia(universe.rv_tickers)
-    rv_reales = [tk for tk in rv_con_historia if tk not in pipeline.synthetic_tickers_]
-    modo_demo = len(rv_reales) < MIN_ACTIVOS_RV_REALES
-
+    modo_demo = len(_reales(universe.rv_tickers)) < MIN_ACTIVOS_RV_REALES
     if modo_demo:
-        rv_tickers = rv_con_historia
-        rf_etf_tickers = _con_historia(universe.rf_etf_tickers)
         logger.warning(
             "MODO DEMOSTRACIÓN: sólo %d tickers de RV con precio real (< %d). Se optimiza sobre "
             "series sintéticas calibradas; los resultados no son inferencia de mercado.",
-            len(rv_reales), MIN_ACTIVOS_RV_REALES,
+            len(_reales(universe.rv_tickers)), MIN_ACTIVOS_RV_REALES,
         )
-    elif EXCLUIR_ACTIVOS_SIN_PRECIO_REAL:
-        rv_tickers = rv_reales
-        rf_etf_tickers = [
-            tk for tk in _con_historia(universe.rf_etf_tickers)
-            if tk not in pipeline.synthetic_tickers_
-        ]
+    if EXCLUIR_ACTIVOS_SIN_PRECIO_REAL and not modo_demo:
+        rv_tickers, rf_etf_tickers = _reales(universe.rv_tickers), _reales(universe.rf_etf_tickers)
     else:
-        rv_tickers = rv_con_historia
-        rf_etf_tickers = _con_historia(universe.rf_etf_tickers)
+        rv_tickers, rf_etf_tickers = list(universe.rv_tickers), list(universe.rf_etf_tickers)
+    tickers_mercado = rv_tickers + rf_etf_tickers
 
-    # --- Registro de los activos descartados ---
-    descartados = sorted(
-        (set(universe.rv_tickers) | set(universe.rf_etf_tickers))
-        - set(rv_tickers) - set(rf_etf_tickers)
-    )
-    for tk in descartados:
-        motivos_exclusion.setdefault(tk, "sin precio real observable (serie sintética)")
+    # --- Registro de los activos sin precio real ---
+    liquidez = pipeline.liquidity_report()
+    descartados = sorted(set(universe.rv_tickers + universe.rf_etf_tickers) - set(tickers_mercado))
+    motivos_exclusion = {tk: "sin precio real observable (serie sintética)" for tk in descartados}
     if descartados:
-        logger.warning(
-            "Excluidos del universo invertible (%s–%s): %s",
-            start_date, end_date, "; ".join(f"{tk} ({motivos_exclusion[tk]})" for tk in descartados),
-        )
+        logger.warning("Excluidos del universo invertible: %s",
+                       "; ".join(f"{tk} ({motivos_exclusion[tk]})" for tk in descartados))
+
+    # --- Tickers listados después del inicio (no recortan la matriz) ---
+    min_start_buffer = pd.Timestamp(start_date) + pd.Timedelta(days=HOLGURA_COBERTURA_DIAS)
+    listados_tarde = [tk for tk in tickers_mercado
+                      if prices[tk].first_valid_index() is None
+                      or prices[tk].first_valid_index() > min_start_buffer]
     if not rf_etf_tickers:
         logger.info("Sin ETFs/FICs de RF con precio observable: el Enfoque B queda vacío en esta corrida.")
 
@@ -3181,13 +3216,13 @@ def main() -> None:
     # --- Fichas de todos los activos (mercado + RF modelada) ---
     specs: Dict[str, AssetSpec] = {}
     market_specs = universe.market_specs()
-    for tk in rv_tickers + rf_etf_tickers:
+    for tk in tickers_mercado:
         specs[tk] = market_specs[tk]
     specs.update(fi_bundle.specs)
 
     # --- Precios y retornos unificados ---
     multi_prices = MarketDataPipeline.build_multi_asset_prices(
-        prices[rv_tickers + rf_etf_tickers], fi_bundle.prices
+        prices[tickers_mercado], fi_bundle.prices, late_start=listados_tarde
     )
     multi_returns = MarketDataPipeline.compute_returns(multi_prices, method="log")
     n_rv = sum(1 for s in specs.values() if s.asset_class is AssetClass.RENTA_VARIABLE)
@@ -3206,7 +3241,8 @@ def main() -> None:
     # --- Reporte de riesgo por activo ---
     risk_report = RiskMetrics.asset_risk_report(
         pd.concat([prices, fi_bundle.prices], axis=1, sort=True).ffill(),
-        pd.concat([multi_returns, returns[[universe.benchmark]]], axis=1, sort=True).dropna(how="any"),
+        pd.concat([multi_returns, returns[[universe.benchmark]]], axis=1, sort=True)
+        .loc[multi_returns.index[0]:].dropna(subset=[universe.benchmark]),
         universe.benchmark, rf_medio, specs,
     )
     print("\n" + risk_report.round(4).to_string())
@@ -3222,14 +3258,23 @@ def main() -> None:
     fecha_cierre = multi_returns.index[-1]
     mu_rf_hoy = np.log1p(fi_engine.expected_returns_at(fecha_cierre))
 
-    # --- Screening de bonos al cierre y retornos pro-forma ---
+    # --- Universo invertible al cierre: bonos y activos de mercado ---
     bonos_no_elegibles = fi_engine.excluded_bonds_at(fecha_cierre)
     if bonos_no_elegibles:
         logger.info("Bonos no elegibles al %s (plazo, spread o emisor): %s",
                     fecha_cierre.date(), sorted(bonos_no_elegibles))
+    motivos_cierre = pipeline.tradability_issues_at(fecha_cierre, multi_returns.index[0], tickers_mercado)
+    if motivos_cierre:
+        logger.info("Activos de mercado no invertibles al %s (ventana %s–%s): %s",
+                    fecha_cierre.date(), multi_returns.index[0].date(), fecha_cierre.date(),
+                    "; ".join(f"{tk} ({m})" for tk, m in sorted(motivos_cierre.items())))
+
+    # --- Retornos pro-forma del universo invertible ---
+    no_invertibles_cierre = (bonos_no_elegibles | set(motivos_cierre)
+                             | set(multi_returns.columns[multi_returns.isna().any()]))
     retornos_estrategicos = fi_engine.proforma_log_returns(
         fecha_cierre,
-        multi_returns.drop(columns=sorted(bonos_no_elegibles & set(multi_returns.columns))),
+        multi_returns.drop(columns=sorted(no_invertibles_cierre & set(multi_returns.columns))),
     )
 
     # --- Optimización de Máximo Sharpe ---
@@ -3277,6 +3322,14 @@ def main() -> None:
     logger.info("-" * 78)
     logger.info("BACKTEST WALK-FORWARD FUERA DE MUESTRA CON BANDAS RV/RF")
 
+    # --- Universo invertible en cada rebalanceo (sólo datos de la ventana) ---
+    motivos_por_fecha: Dict[pd.Timestamp, Dict[str, str]] = {}
+
+    def no_invertibles(fecha: pd.Timestamp, inicio_ventana: pd.Timestamp) -> Set[str]:
+        motivos = pipeline.tradability_issues_at(fecha, inicio_ventana, tickers_mercado)
+        motivos_por_fecha[pd.Timestamp(fecha)] = motivos
+        return set(motivos) | fi_engine.excluded_bonds_at(fecha)
+
     # --- Configuración y ejecución del backtest ---
     backtester = WalkForwardBacktester(
         multi_prices,
@@ -3289,28 +3342,48 @@ def main() -> None:
         group_constraints=policy.group_constraints(),
         expected_returns_fn=lambda d: np.log1p(fi_engine.expected_returns_at(d)),
         rf_fn=lambda d: fi_engine.risk_free_at(d, policy.rf_tenor_years),
-        exclude_fn=fi_engine.excluded_bonds_at,
+        exclude_fn=no_invertibles,
         window_fn=fi_engine.proforma_log_returns,
     )
     weights_history = backtester.run()
     perf_summary = backtester.performance_summary()
 
-    # --- Elegibilidad de bonos a lo largo del backtest ---
-    bonos =[tk for tk, sp in specs.items() if sp.sub_class is AssetSubClass.RF_BONO]
-    elegibles = pd.DataFrame({
-        d: {tk: tk not in excl for tk in bonos} for d, excl in backtester.excluded_history_.items()
-    }).T
-    fechas_elegible = {tk: elegibles.index[elegibles[tk]] for tk in bonos}
-    tabla_elegibilidad = pd.DataFrame({
-        "vencimiento": {tk: specs[tk].metadata["vencimiento"] for tk in bonos},
-        "rebalanceos_elegible": {tk: f"{int(elegibles[tk].sum())}/{len(elegibles)}" for tk in bonos},
-        "primer_rebalanceo": {tk: (f[0].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
-        "ultimo_rebalanceo": {tk: (f[-1].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
-        "peso_medio_%_cuando_elegible": {
-            tk: (float(weights_history.loc[f, tk].mean() * 100) if len(f) and tk in weights_history else 0.0)
-            for tk, f in fechas_elegible.items()
-        },
-    })
+    # --- Elegibilidad por activo a lo largo del backtest ---
+    def _tabla_elegibilidad(tickers: Sequence[str]) -> pd.DataFrame:
+        elegibles = pd.DataFrame({
+            d: {tk: tk not in excl for tk in tickers} for d, excl in backtester.excluded_history_.items()
+        }).T
+        fechas_elegible = {tk: elegibles.index[elegibles[tk]] for tk in tickers}
+        return pd.DataFrame({
+            "rebalanceos_elegible": {tk: f"{int(elegibles[tk].sum())}/{len(elegibles)}" for tk in tickers},
+            "primer_rebalanceo": {tk: (f[0].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
+            "ultimo_rebalanceo": {tk: (f[-1].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
+            "peso_medio_%_cuando_elegible": {
+                tk: (float(weights_history.loc[f, tk].mean() * 100) if len(f) and tk in weights_history else 0.0)
+                for tk, f in fechas_elegible.items()
+            },
+        })
+
+    bonos = [tk for tk, sp in specs.items() if sp.sub_class is AssetSubClass.RF_BONO]
+    tabla_elegibilidad = _tabla_elegibilidad(bonos)
+    tabla_elegibilidad.insert(0, "vencimiento", {tk: specs[tk].metadata["vencimiento"] for tk in bonos})
+
+    # --- Universo de mercado: motivo de exclusión más frecuente y al cierre ---
+    def _categoria(motivo: str) -> str:
+        return motivo.split(":")[0].split(" desde")[0]
+
+    tabla_universo = _tabla_elegibilidad(tickers_mercado)
+    ultima_fecha = max(motivos_por_fecha)
+    tabla_universo["motivo_principal"] = {
+        tk: (pd.Series([_categoria(m[tk]) for m in motivos_por_fecha.values() if tk in m]).mode().iloc[0]
+             if any(tk in m for m in motivos_por_fecha.values()) else "—")
+        for tk in tickers_mercado
+    }
+    tabla_universo["estado_ultimo_rebalanceo"] = {
+        tk: motivos_por_fecha[ultima_fecha].get(tk, "elegible") for tk in tickers_mercado
+    }
+    for tk in tickers_mercado:
+        motivos_exclusion.setdefault(tk, f"elegible en {tabla_universo.loc[tk, 'rebalanceos_elegible']} rebalanceos")
 
     # --- Salida en consola del backtest ---
     print("\n--- Asignación por clase de activo en cada rebalanceo (%) ---")
@@ -3326,6 +3399,8 @@ def main() -> None:
     print(pd.Series(perf_summary, name="valor").round(4).to_string())
     print("\n--- Elegibilidad de bonos en el backtest (screening dinámico) ---")
     print(tabla_elegibilidad.round(2).to_string())
+    print("\n--- Universo de mercado en el backtest (liquidez y cobertura en la ventana de cada rebalanceo) ---")
+    print(tabla_universo.round(2).to_string())
 
     # ---------------------------------------------------------------- #
     # 8) REPORTE HTML INTERACTIVO
@@ -3365,13 +3440,16 @@ def main() -> None:
         "o sale según su plazo y spread vigentes) y su covarianza se estima con retornos pro-forma "
         "que aplican los choques históricos a su duración actual."
     )
-    if descartados:
-        report.add_note(
-            "<b>Integridad de datos.</b> Se excluyeron del universo invertible los siguientes "
-            "activos: " + "; ".join(f"<b>{tk}</b> ({motivos_exclusion[tk]})" for tk in descartados)
-            + ". El motor no sustituye precios faltantes por series simuladas dentro del optimizador, "
-            "ni admite títulos cuyo precio congelado haría parecer su riesgo menor al real."
-        )
+    report.add_note(
+        "<b>Integridad de datos.</b> "
+        + ("Se excluyeron del universo los activos sin precio real: "
+           + "; ".join(f"<b>{tk}</b>" for tk in descartados) + ". " if descartados else "")
+        + "La historia, la cotización reciente y la liquidez se evalúan en cada rebalanceo sólo con "
+        f"los precios de su ventana de estimación ({LOOKBACK_DIAS} días): un título entra o sale "
+        "según su comportamiento hasta esa fecha, sin usar información posterior. El motor no "
+        "sustituye precios faltantes por series simuladas dentro del optimizador, ni admite títulos "
+        "cuyo precio congelado haría parecer su riesgo menor al real."
+    )
 
     # --- Sección: curva TES y renta fija ---
     curva_cierre = fi_engine.shocks.curve_at(multi_returns.index[-1])
@@ -3393,6 +3471,10 @@ def main() -> None:
     report.add_table(
         "Screening dinámico — elegibilidad de cada bono en los rebalanceos",
         tabla_elegibilidad, "{:.2f}",
+    )
+    report.add_table(
+        "Universo de mercado — elegibilidad por liquidez y cobertura en los rebalanceos",
+        tabla_universo, "{:.2f}",
     )
 
     # --- Sección: optimización estratégica ---
@@ -3420,9 +3502,10 @@ def main() -> None:
         tabla_liquidez = liquidez.assign(
             primer_dato=liquidez["primer_dato"].dt.date,
             ultimo_dato=liquidez["ultimo_dato"].dt.date,
-            estado=[motivos_exclusion.get(tk, "incluido") for tk in liquidez.index],
+            estado=[motivos_exclusion.get(tk, "—") for tk in liquidez.index],
         ).sort_values("pct_sin_movimiento", ascending=False)
-        report.add_table("Liquidez y cobertura de precios por ticker", tabla_liquidez, "{:.3f}")
+        report.add_table("Liquidez y cobertura de precios por ticker (ventana completa)",
+                         tabla_liquidez, "{:.3f}")
 
     # --- Escritura del reporte ---
     report_path = report.write(os.path.join(DIRECTORIO_SALIDA, "reporte_interactivo.html"))
