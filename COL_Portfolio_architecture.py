@@ -639,13 +639,8 @@ class TESYieldCurve:
         Los TES tasa fija en pesos pagan cupón anual (freq = 1), por lo que
         esta es la convención por defecto.
         """
-        n = max(int(round(maturity_years * freq)), 1)
-        times = np.arange(1, n + 1, dtype=float) / freq
-        dfs = np.asarray(self.discount_factor(times), dtype=float)
-        annuity = dfs.sum() / freq
-        if annuity <= 0:
-            return float(self.get_rate(maturity_years))
-        return float((1.0 - dfs[-1]) / annuity)
+        times = BondAnalytics.coupon_times(maturity_years, freq)
+        return float(BondAnalytics.par_coupon(self.get_rate(times), times, freq))
 
     # ------------------------------------------------------------------ #
     # VISUALIZACIONES
@@ -887,23 +882,47 @@ class BondAnalytics:
 
     # ------------------------------------------------------------------ #
     @staticmethod
-    def duration_convexity(
-        times: np.ndarray, cashflows: np.ndarray, ytm: float
-    ) -> Tuple[float, float, float]:
+    def duration_convexity(times: np.ndarray, cashflows: np.ndarray, ytm):
         """
         Duración de Macaulay, Duración Modificada y Convexidad bajo tasa E.A.
 
             D_mod = D_mac / (1 + y)
             C     = Σ t·(t+1)·PV_t / (P · (1+y)²)
+
+        Con `ytm` escalar devuelve tres floats; con `ytm` de forma (m,) y
+        `cashflows` de forma (m, T) (un bono por fila) devuelve tres arreglos.
+        Donde el precio no es positivo el resultado es NaN.
         """
-        pv = cashflows * (1.0 + ytm) ** (-times)
-        price = pv.sum()
-        if price <= 0:
-            return float("nan"), float("nan"), float("nan")
-        macaulay = float((times * pv).sum() / price)
-        modified = macaulay / (1.0 + ytm)
-        convexity = float((times * (times + 1.0) * pv).sum() / (price * (1.0 + ytm) ** 2))
+        ytm = np.asarray(ytm, dtype=float)
+        pv = cashflows * (1.0 + ytm[..., None]) ** (-times)
+        price = pv.sum(axis=-1)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            macaulay = (times * pv).sum(axis=-1) / price
+            convexity = (times * (times + 1.0) * pv).sum(axis=-1) / (price * (1.0 + ytm) ** 2)
+        valid = price > 0
+        macaulay, modified, convexity = (
+            np.where(valid, x, np.nan) for x in (macaulay, macaulay / (1.0 + ytm), convexity)
+        )
+        if ytm.ndim == 0:
+            return float(macaulay), float(modified), float(convexity)
         return macaulay, modified, convexity
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def coupon_times(maturity_years: float, freq: int = 1) -> np.ndarray:
+        """Fechas de cupón (años) de un bono par al plazo dado: 1/freq, 2/freq, …, T."""
+        n = max(int(round(maturity_years * freq)), 1)
+        return np.arange(1, n + 1, dtype=float) / freq
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def par_coupon(zero_rates: np.ndarray, times: np.ndarray, freq: int = 1) -> Union[float, np.ndarray]:
+        """
+        Cupón par c = (1 − DF(T)) / (Σ_i DF(t_i) / freq) a partir de las tasas
+        cero en `times` (última dimensión; admite una curva o una por fecha).
+        """
+        dfs = (1.0 + np.asarray(zero_rates, dtype=float)) ** (-times)
+        return (1.0 - dfs[..., -1]) / (dfs.sum(axis=-1) / freq)
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -1221,26 +1240,16 @@ class TESNodeBuilder:
     # ------------------------------------------------------------------ #
     def _par_yield_history(self, shocks: CurveShockGenerator, tenor: float) -> np.ndarray:
         """Cupón par diario al plazo `tenor`: (1 − DF_T) / Σ DF_i / freq."""
-        f = self.coupon_freq
-        n = max(int(round(tenor * f)), 1)
-        times = np.arange(1, n + 1, dtype=float) / f
-        zeros = shocks.levels_at(times).to_numpy()
-        dfs = (1.0 + zeros) ** (-times[None, :])
-        return (1.0 - dfs[:, -1]) / (dfs.sum(axis=1) / f)
+        times = BondAnalytics.coupon_times(tenor, self.coupon_freq)
+        return BondAnalytics.par_coupon(shocks.levels_at(times).to_numpy(), times, self.coupon_freq)
 
     # ------------------------------------------------------------------ #
     def _par_bond_risk(self, par: np.ndarray, tenor: float) -> Tuple[np.ndarray, np.ndarray]:
         """Duración modificada y convexidad de un bono par (cupón = tasa) por fecha."""
-        f = self.coupon_freq
-        n = max(int(round(tenor * f)), 1)
-        times = np.arange(1, n + 1, dtype=float) / f
-        y = par[:, None]
-        cfs = np.repeat(y / f, n, axis=1)
+        times = BondAnalytics.coupon_times(tenor, self.coupon_freq)
+        cfs = np.repeat(par[:, None] / self.coupon_freq, len(times), axis=1)
         cfs[:, -1] += 1.0
-        pv = cfs * (1.0 + y) ** (-times[None, :])
-        price = pv.sum(axis=1)
-        dmod = (pv * times).sum(axis=1) / price / (1.0 + par)
-        conv = (pv * times * (times + 1.0)).sum(axis=1) / (price * (1.0 + par) ** 2)
+        _, dmod, conv = BondAnalytics.duration_convexity(times, cfs, par)
         return dmod, conv
 
 
@@ -2269,56 +2278,42 @@ class PortfolioOptimizer:
     # ------------------------------------------------------------------ #
     def _initial_weights(self) -> np.ndarray:
         """
-        Punto inicial factible: presupuesto por grupo en el punto medio de su
-        banda (reescalado a 1) y reparto equiponderado dentro del grupo con
-        tope por activo. Sirve de punto inicial de la mínima varianza y de respaldo final.
+        Portafolio factible más cercano al equiponderado (proyección euclídea
+        sobre presupuesto, topes y bandas). Sirve de punto inicial de la mínima
+        varianza y de respaldo final cuando el solver no converge.
         """
-        # --- Sin bandas: reparto equiponderado con tope ---
-        if not self.group_constraints:
-            w = np.minimum(np.repeat(1.0 / self.n, self.n), self.max_weights)
+        equal = np.full(self.n, 1.0 / self.n)
+        w = self._minimize_quadratic(np.eye(self.n), equal, start=equal)
+        if w is None:
+            w = np.minimum(equal, self.max_weights)
+            w = w / w.sum()
+        return w
+
+    # ------------------------------------------------------------------ #
+    def _minimize_quadratic(
+        self, quad: np.ndarray, center: np.ndarray, start: np.ndarray
+    ) -> Optional[np.ndarray]:
+        """
+        Resuelve min (w−center)'·quad·(w−center) sobre el conjunto factible
+        (presupuesto, topes y bandas): QP convexo. Devuelve None si SLSQP no
+        converge a un punto factible.
+        """
+        constraints = [optimize.LinearConstraint(np.ones((1, self.n)), 1.0, 1.0)]
+        if len(self._band_matrix):
+            constraints.append(optimize.LinearConstraint(self._band_matrix, self._band_lo, self._band_hi))
+        result = optimize.minimize(
+            lambda w: (w - center) @ quad @ (w - center),
+            start,
+            jac=lambda w: 2.0 * quad @ (w - center),
+            method="SLSQP",
+            bounds=optimize.Bounds(self.min_weight, self.max_weights),
+            constraints=constraints,
+            options={"maxiter": 1000, "ftol": 1e-12},
+        )
+        w = np.clip(result.x, 0.0, None)
+        if result.success and w.sum() > 0 and self.is_feasible(w / w.sum()):
             return w / w.sum()
-
-        # --- Presupuesto por grupo en el punto medio de su banda ---
-        labels = [gc.label for gc in self.group_constraints]
-        lo = np.array([gc.min_weight for gc in self.group_constraints])
-        hi = np.array([min(gc.max_weight, float(self.max_weights[self._group_index[l]].sum()))
-                       for gc, l in zip(self.group_constraints, labels)])
-        budget = np.clip((lo + hi) / 2.0, lo, hi)
-
-        # --- Ajuste del residual respetando las bandas ---
-        for _ in range(50):
-            gap = 1.0 - budget.sum()
-            if abs(gap) < 1e-10:
-                break
-            slack = (hi - budget) if gap > 0 else (budget - lo)
-            total_slack = slack.sum()
-            if total_slack <= 1e-12:
-                break
-            budget = budget + gap * slack / total_slack
-
-        # --- Reparto dentro de cada grupo con tope por activo ---
-        w = np.zeros(self.n)
-        assigned = np.zeros(self.n, dtype=bool)
-        for label, b in zip(labels, budget):
-            idx = self._group_index[label]
-            if len(idx) == 0:
-                continue
-            share = np.minimum(b / len(idx), self.max_weights[idx])
-            deficit = b - share.sum()
-            if deficit > 1e-12:
-                room = self.max_weights[idx] - share
-                if room.sum() > 1e-12:
-                    share = share + deficit * room / room.sum()
-            w[idx] = share
-            assigned[idx] = True
-
-        # --- Activos sin grupo restringido: reciben el remanente ---
-        rest = np.where(~assigned)[0]
-        remainder = max(1.0 - w.sum(), 0.0)
-        if len(rest) and remainder > 1e-12:
-            w[rest] = np.minimum(remainder / len(rest), self.max_weights[rest])
-        total = w.sum()
-        return w / total if total > 0 else np.repeat(1.0 / self.n, self.n)
+        return None
 
     def _random_feasible_weights(self, rng: np.random.Generator) -> np.ndarray:
         """Peso aleatorio que respeta las bandas por clase y el tope por activo."""
@@ -2333,9 +2328,7 @@ class PortfolioOptimizer:
         lo = np.array([gc.min_weight for gc in self.group_constraints])
         hi = np.array([gc.max_weight for gc in self.group_constraints])
         budget = lo + rng.random(len(lo)) * (hi - lo)
-        budget = np.clip(budget, lo, hi)
-        budget = budget / budget.sum() if budget.sum() > 0 else budget
-        budget = np.clip(budget, lo, hi)
+        budget = np.clip(budget / budget.sum(), lo, hi)
         budget = budget / budget.sum()
 
         # --- Reparto Dirichlet dentro de cada grupo ---
@@ -2443,22 +2436,7 @@ class PortfolioOptimizer:
     # ------------------------------------------------------------------ #
     def _min_variance_weights(self) -> Optional[np.ndarray]:
         """Portafolio de mínima varianza dentro de topes y bandas (QP convexo); None si falla."""
-        constraints = [optimize.LinearConstraint(np.ones((1, self.n)), 1.0, 1.0)]
-        if len(self._band_matrix):
-            constraints.append(optimize.LinearConstraint(self._band_matrix, self._band_lo, self._band_hi))
-        result = optimize.minimize(
-            lambda w: w @ self.cov_ @ w,
-            self._initial_weights(),
-            jac=lambda w: 2.0 * self.cov_ @ w,
-            method="SLSQP",
-            bounds=optimize.Bounds(self.min_weight, self.max_weights),
-            constraints=constraints,
-            options={"maxiter": 1000, "ftol": 1e-12},
-        )
-        w = np.clip(result.x, 0.0, None)
-        if result.success and w.sum() > 0 and self.is_feasible(w / w.sum()):
-            return w / w.sum()
-        return None
+        return self._minimize_quadratic(self.cov_, np.zeros(self.n), start=self._initial_weights())
 
     # ------------------------------------------------------------------ #
     # DIAGNÓSTICO DE LA SOLUCIÓN
