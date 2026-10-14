@@ -18,7 +18,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 # --- Cómputo numérico y estadístico ------------------------------------------
 import numpy as np
 import pandas as pd
-from scipy import interpolate, optimize
+from scipy import interpolate, optimize, signal
 from sklearn.covariance import LedoitWolf
 
 # --- Visualización ------------------------------------------------------------
@@ -482,15 +482,9 @@ class MarketDataPipeline:
     # TRANSFORMACIONES Y ENSAMBLE DE LA MATRIZ
     # ------------------------------------------------------------------ #
     @staticmethod
-    def compute_returns(prices: pd.DataFrame, method: str = "log") -> pd.DataFrame:
-        """Calcula retornos diarios (log o simples) a partir de precios."""
-        if method == "log":
-            returns = np.log(prices / prices.shift(1))
-        elif method == "simple":
-            returns = prices.pct_change()
-        else:
-            raise ValueError("method debe ser 'log' o 'simple'.")
-        return returns.dropna(how="all")
+    def compute_returns(prices: pd.DataFrame) -> pd.DataFrame:
+        """Calcula retornos logarítmicos diarios a partir de precios."""
+        return np.log(prices).diff().dropna(how="all")
 
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -764,8 +758,8 @@ class BanrepTESHistory:
         intermedio desde la URL que declara el propio certificado y se reintenta
         exigiendo que la cadena termine en una raíz de confianza.
         """
-        import ssl
         import urllib.error
+        import urllib.parse
         import urllib.request
 
         # --- Primer intento: verificación TLS estándar ---
@@ -779,7 +773,7 @@ class BanrepTESHistory:
                 raise
 
         # --- Reintento: completando la cadena con el intermedio (AIA) ---
-        host = urllib.request.urlparse(url).hostname
+        host = urllib.parse.urlparse(url).hostname
         context = self._context_with_intermediate(host)
         with urllib.request.urlopen(req, timeout=self.timeout, context=context) as resp:
             return resp.read()
@@ -787,8 +781,6 @@ class BanrepTESHistory:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _base_ssl_context() -> "ssl.SSLContext":
-        import ssl
-
         try:
             import certifi
             return ssl.create_default_context(cafile=certifi.where())
@@ -798,7 +790,6 @@ class BanrepTESHistory:
     # ------------------------------------------------------------------ #
     def _context_with_intermediate(self, host: str) -> "ssl.SSLContext":
         import re
-        import ssl
         import urllib.request
 
         # --- Localizar la URL del certificado intermedio ---
@@ -1011,13 +1002,9 @@ class CurveShockGenerator:
         factor_vols = np.array([cfg.level_vol_bp, cfg.slope_vol_bp, cfg.curvature_vol_bp]) / 1e4
 
         # --- Factores con reversión a la media ---
-        factors = np.zeros((n, 3))
-        f = np.zeros(3)
-        for i in range(n):
-            f = f * (1.0 - cfg.mean_reversion) + rng.normal(0.0, factor_vols)
-            factors[i] = f
-
-        delta_factors = np.diff(np.vstack([np.zeros((1, 3)), factors]), axis=0)
+        innovations = rng.normal(0.0, factor_vols, size=(n, 3))
+        factors = signal.lfilter([1.0], [1.0, -(1.0 - cfg.mean_reversion)], innovations, axis=0)
+        delta_factors = np.diff(factors, prepend=0.0, axis=0)
         changes = delta_factors @ loadings.T
 
         # --- Componente correlacionado con la renta variable ---
@@ -1046,9 +1033,7 @@ class CurveShockGenerator:
         # --- Interpolación a los plazos solicitados ---
         hist = history.sort_index().astype(float)
         available = np.asarray([float(c) for c in hist.columns], dtype=float)
-        interp = np.vstack([
-            np.interp(self.tenors, available, row) for row in hist.values
-        ])
+        interp = self._interp_rows(hist.to_numpy(), available, self.tenors)
 
         # --- Registro de niveles y variaciones ---
         levels_df = pd.DataFrame(interp, index=hist.index, columns=self.tenors)
@@ -1080,13 +1065,15 @@ class CurveShockGenerator:
         con extrapolación plana en los extremos, pero vectorizada.
         """
         mats = np.asarray(maturities, dtype=float)
-        t = self.tenors
-        m = np.clip(mats, t[0], t[-1])
-        j = np.clip(np.searchsorted(t, m, side="right") - 1, 0, len(t) - 2)
-        w = (m - t[j]) / (t[j + 1] - t[j])
-        c = frame.to_numpy()
-        vals = c[:, j] * (1.0 - w) + c[:, j + 1] * w
+        vals = self._interp_rows(frame.to_numpy(), self.tenors, mats)
         return pd.DataFrame(vals, index=frame.index, columns=mats)
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _interp_rows(values: np.ndarray, src_tenors: np.ndarray, new_tenors: np.ndarray) -> np.ndarray:
+        """Interpolación lineal de cada fila de `values` a `new_tenors`, con extrapolación plana."""
+        clipped = np.clip(new_tenors, src_tenors.min(), src_tenors.max())
+        return interpolate.interp1d(src_tenors, values, axis=1)(clipped)
 
     # ------------------------------------------------------------------ #
     def curve_at(self, date: pd.Timestamp) -> TESYieldCurve:
@@ -1211,13 +1198,13 @@ class TESNodeBuilder:
         idx = shocks.levels_.index
         d_tau = np.diff(np.asarray((idx - idx[0]).days, dtype=float) / 365.25, prepend=0.0)
         out: Dict[str, pd.Series] = {}
+        prev = lambda x: np.r_[x[0], x[:-1]]
 
         for spec in node_specs:
             # --- Cupón par, duración y convexidad rezagados un día ---
             tenor = float(spec.metadata["plazo_anios"])
             par = self._par_yield_history(shocks, tenor)
             dmod, conv = self._par_bond_risk(par, tenor)
-            prev = lambda x: np.concatenate([[x[0]], x[:-1]])
             par_prev, dmod_prev, conv_prev = prev(par), prev(dmod), prev(conv)
 
             # --- Componentes del retorno: carry, roll-down y precio ---
@@ -1465,14 +1452,11 @@ class BondScreener:
         Índices que exceden el máximo de títulos por emisor. Se conservan los de
         mayor YTM ajustada por liquidez (columnas 'emisor', 'ytm', 'liquidez').
         """
-        drop: List[object] = []
-        if self.criteria.max_por_emisor > 0 and not candidates.empty:
-            score = candidates["ytm"] * candidates["liquidez"]
-            for _, grp in candidates.groupby("emisor"):
-                if len(grp) > self.criteria.max_por_emisor:
-                    ranked = score.loc[grp.index].sort_values(ascending=False)
-                    drop.extend(ranked.index[self.criteria.max_por_emisor:])
-        return pd.Index(drop)
+        if self.criteria.max_por_emisor <= 0 or candidates.empty:
+            return pd.Index([])
+        score = candidates["ytm"] * candidates["liquidez"]
+        rank = score.groupby(candidates["emisor"]).rank(method="first", ascending=False)
+        return candidates.index[rank > self.criteria.max_por_emisor]
 
     # ------------------------------------------------------------------ #
     # SCREENING
@@ -1563,7 +1547,8 @@ class BondScreener:
 
         # --- Máximo de títulos por emisor ---
         passed = pd.DataFrame.from_dict(rows, orient="index")
-        return [tk for tk in passed.index if tk not in self._cap_per_issuer(passed)]
+        dropped = self._cap_per_issuer(passed)
+        return [tk for tk in passed.index if tk not in dropped]
 
     # ------------------------------------------------------------------ #
     def _specs_from_rows(self, rows: pd.DataFrame, include_rolldown: bool) -> List[AssetSpec]:
@@ -1635,7 +1620,7 @@ class BondScreener:
         level_rows = levels.to_numpy()
         tau = self._years_since_as_of(levels.index)
         d_tau = np.diff(tau, prepend=tau[0])
-        reinvest = np.array([np.interp(self.reinvest_tenor, tenors, row) for row in level_rows])
+        reinvest = shocks.levels_at([self.reinvest_tenor]).iloc[:, 0].to_numpy()
         cash_ret = (1.0 + reinvest) ** d_tau - 1.0
 
         rng = np.random.default_rng(seed)
@@ -2016,9 +2001,7 @@ class RiskMetrics:
     @staticmethod
     def annualized_return(returns: pd.Series) -> float:
         """Retorno geométrico anualizado a partir de retornos log diarios."""
-        cumulative = np.exp(returns.sum())
-        n_years = len(returns) / RiskMetrics.TRADING_DAYS
-        return float(cumulative ** (1 / n_years) - 1) if n_years > 0 else 0.0
+        return float(np.expm1(returns.mean() * RiskMetrics.TRADING_DAYS)) if len(returns) else 0.0
 
     @staticmethod
     def beta(asset_returns: pd.Series, market_returns: pd.Series) -> float:
@@ -2026,8 +2009,7 @@ class RiskMetrics:
         aligned = pd.concat([asset_returns, market_returns], axis=1).dropna()
         if aligned.shape[0] < 2:
             return float("nan")
-        cov_matrix = np.cov(aligned.iloc[:, 0], aligned.iloc[:, 1])
-        return float(cov_matrix[0, 1] / cov_matrix[1, 1])
+        return float(aligned.cov().iloc[0, 1] / aligned.iloc[:, 1].var())
 
     @staticmethod
     def max_drawdown(price_series: pd.Series) -> float:
@@ -2172,6 +2154,7 @@ class PortfolioOptimizer:
             gc.validate()
         self._group_index = self._build_group_index()
         self._validate_feasibility()
+        self._band_matrix, self._band_lo, self._band_hi = self._build_band_system()
 
         # --- Momentos: covarianza ---
         self.cov_, self.shrinkage_intensity_ = MarketDataPipeline.covariance_matrix(
@@ -2182,8 +2165,7 @@ class PortfolioOptimizer:
         # --- Momentos: retorno esperado (μ) ---
         override = (pd.Series(expected_returns, dtype=float).reindex(self.assets).dropna()
                     if expected_returns is not None else pd.Series(dtype=float))
-        self.mu_sample_series_ = pd.Series(self.returns.mean().values * trading_days,
-                                           index=self.assets, name="mu_muestral")
+        self.mu_sample_series_ = (self.returns.mean() * trading_days).rename("mu_muestral")
         mu_series = self.mu_sample_series_.copy()
         self.mu_shrinkage_: Dict[str, float] = {}
         if self.mu_estimator == "bayes_stein":
@@ -2272,18 +2254,23 @@ class PortfolioOptimizer:
                 raise ValueError(f"Bandas infactibles: los máximos suman {total_max:.0%} < 100%.")
 
     # ------------------------------------------------------------------ #
-    def _constraints(self) -> List[Dict[str, object]]:
-        # --- Presupuesto: Σ w = 1 ---
-        cons: List[Dict[str, object]] = [{"type": "eq", "fun": lambda w: np.sum(w) - 1.0}]
-
-        # --- Bandas por clase: min ≤ Σ w_g ≤ max ---
-        for gc in self.group_constraints:
-            idx = self._group_index[gc.label]
-            if len(idx) == 0:
-                continue
-            cons.append({"type": "ineq", "fun": lambda w, i=idx, lo=gc.min_weight: float(w[i].sum() - lo)})
-            cons.append({"type": "ineq", "fun": lambda w, i=idx, hi=gc.max_weight: float(hi - w[i].sum())})
+    def _constraints(self) -> List[optimize.LinearConstraint]:
+        """Presupuesto Σ w = 1 y bandas por clase min ≤ Σ w_g ≤ max, como restricciones lineales."""
+        cons = [optimize.LinearConstraint(np.ones((1, self.n)), 1.0, 1.0)]
+        if len(self._band_matrix):
+            cons.append(optimize.LinearConstraint(self._band_matrix, self._band_lo, self._band_hi))
         return cons
+
+    # ------------------------------------------------------------------ #
+    def _build_band_system(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Matriz de pertenencia (bandas x activos) y límites inferior/superior de cada banda."""
+        active = [gc for gc in self.group_constraints if len(self._group_index[gc.label])]
+        matrix = np.zeros((len(active), self.n))
+        for row, gc in enumerate(active):
+            matrix[row, self._group_index[gc.label]] = 1.0
+        return (matrix,
+                np.array([gc.min_weight for gc in active], dtype=float),
+                np.array([gc.max_weight for gc in active], dtype=float))
 
     # ------------------------------------------------------------------ #
     # PUNTOS INICIALES FACTIBLES
@@ -2393,14 +2380,8 @@ class PortfolioOptimizer:
             return False
         if np.any(w < -tol) or np.any(w > self.max_weights + tol):
             return False
-        for gc in self.group_constraints:
-            idx = self._group_index[gc.label]
-            if len(idx) == 0:
-                continue
-            g = float(w[idx].sum())
-            if g < gc.min_weight - tol or g > gc.max_weight + tol:
-                return False
-        return True
+        exposure = self._band_matrix @ w
+        return bool(np.all(exposure >= self._band_lo - tol) and np.all(exposure <= self._band_hi + tol))
 
     def max_sharpe(self, n_restarts: int = 3, seed: int = 11) -> pd.Series:
         """
@@ -2415,7 +2396,7 @@ class PortfolioOptimizer:
         antes de caer al punto medio de las bandas.
         """
         # --- Límites, restricciones y puntos iniciales ---
-        bounds = [(self.min_weight, float(mx)) for mx in self.max_weights]
+        bounds = optimize.Bounds(self.min_weight, self.max_weights)
         constraints = self._constraints()
         w0 = self._initial_weights()
 
@@ -2424,7 +2405,6 @@ class PortfolioOptimizer:
 
         # --- Resolución con SLSQP (reinicios si no converge) ---
         best_w: Optional[np.ndarray] = None
-        best_obj = np.inf
         for start in starts:
             result = optimize.minimize(
                 self._neg_sharpe,
@@ -2442,8 +2422,8 @@ class PortfolioOptimizer:
             if total <= 0:
                 continue
             w = w / total
-            if self.is_feasible(w) and result.fun < best_obj:
-                best_w, best_obj = w, float(result.fun)
+            if self.is_feasible(w):
+                best_w = w
                 break
 
         # --- Respaldo: punto medio factible de las bandas ---
@@ -2586,7 +2566,7 @@ class WalkForwardBacktester:
     ) -> None:
         # --- Datos y parámetros del backtest ---
         self.prices = prices.dropna(how="all")
-        self.returns = MarketDataPipeline.compute_returns(self.prices, method="log")
+        self.returns = MarketDataPipeline.compute_returns(self.prices)
         self.lookback_days = lookback_days
         self.rebalance_freq = rebalance_freq
         self.rf = rf
@@ -2623,9 +2603,10 @@ class WalkForwardBacktester:
     # ------------------------------------------------------------------ #
     def _rebalance_dates(self) -> List[pd.Timestamp]:
         idx = self.returns.index
+        if len(idx) < self.lookback_days:
+            return []
         dates = pd.Series(idx, index=idx).resample(self.rebalance_freq).last().dropna()
-        valid = [pd.Timestamp(d) for d in dates if (idx <= d).sum() >= self.lookback_days]
-        return valid
+        return [pd.Timestamp(d) for d in dates[dates >= idx[self.lookback_days - 1]]]
 
     # ------------------------------------------------------------------ #
     def _in_sample(self, reb_date: pd.Timestamp) -> pd.DataFrame:
@@ -3100,7 +3081,7 @@ def main() -> None:
         universe.all_tickers + [universe.benchmark], start_date, end_date, seed=SEMILLA_ALEATORIA
     )
     prices = pipeline.fetch_prices()
-    returns = pipeline.compute_returns(prices, method="log")
+    returns = pipeline.compute_returns(prices)
     logger.info("Precios obtenidos: %d filas x %d activos.", *prices.shape)
 
     # --- Selección del universo (datos reales vs. modo demostración) ---
@@ -3224,7 +3205,7 @@ def main() -> None:
     multi_prices = MarketDataPipeline.build_multi_asset_prices(
         prices[tickers_mercado], fi_bundle.prices, late_start=listados_tarde
     )
-    multi_returns = MarketDataPipeline.compute_returns(multi_prices, method="log")
+    multi_returns = MarketDataPipeline.compute_returns(multi_prices)
     n_rv = sum(1 for s in specs.values() if s.asset_class is AssetClass.RENTA_VARIABLE)
     n_rf = len(specs) - n_rv
     logger.info(
