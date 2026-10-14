@@ -2090,9 +2090,9 @@ class PortfolioOptimizer:
         0 ≤ w_i ≤ w_max,i
         min_g ≤ Σ_{i ∈ g} w_i ≤ max_g       (p. ej. 40% ≤ Σ w_RV ≤ 60%)
 
-    Todo se resuelve con `scipy.optimize.minimize` (SLSQP): la igualdad de
-    presupuesto entra como restricción 'eq' y cada banda de grupo como dos
-    restricciones 'ineq'.
+    El Sharpe no es cóncavo en w, pero con el cambio de variable y = w/(μ−rf)'w
+    el problema se vuelve un QP convexo (ver `max_sharpe`), que se resuelve
+    con `scipy.optimize.minimize` (SLSQP) hasta el óptimo global.
 
     La matriz de covarianza se estima por defecto con shrinkage de
     Ledoit-Wolf (2004), que combina la covarianza muestral con un target
@@ -2254,14 +2254,6 @@ class PortfolioOptimizer:
                 raise ValueError(f"Bandas infactibles: los máximos suman {total_max:.0%} < 100%.")
 
     # ------------------------------------------------------------------ #
-    def _constraints(self) -> List[optimize.LinearConstraint]:
-        """Presupuesto Σ w = 1 y bandas por clase min ≤ Σ w_g ≤ max, como restricciones lineales."""
-        cons = [optimize.LinearConstraint(np.ones((1, self.n)), 1.0, 1.0)]
-        if len(self._band_matrix):
-            cons.append(optimize.LinearConstraint(self._band_matrix, self._band_lo, self._band_hi))
-        return cons
-
-    # ------------------------------------------------------------------ #
     def _build_band_system(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Matriz de pertenencia (bandas x activos) y límites inferior/superior de cada banda."""
         active = [gc for gc in self.group_constraints if len(self._group_index[gc.label])]
@@ -2279,7 +2271,7 @@ class PortfolioOptimizer:
         """
         Punto inicial factible: presupuesto por grupo en el punto medio de su
         banda (reescalado a 1) y reparto equiponderado dentro del grupo con
-        tope por activo. SLSQP converge mucho mejor desde un punto factible.
+        tope por activo. Sirve de punto inicial de la mínima varianza y de respaldo final.
         """
         # --- Sin bandas: reparto equiponderado con tope ---
         if not self.group_constraints:
@@ -2368,12 +2360,6 @@ class PortfolioOptimizer:
         vol = float(np.sqrt(w @ self.cov_ @ w))
         return ret, vol
 
-    def _neg_sharpe(self, w: np.ndarray) -> float:
-        ret, vol = self._portfolio_perf(w)
-        if vol == 0:
-            return 0.0
-        return -(ret - self.rf_log_) / vol
-
     def is_feasible(self, w: np.ndarray, tol: float = 1e-6) -> bool:
         """Verifica presupuesto, topes individuales y bandas por clase."""
         if abs(float(np.sum(w)) - 1.0) > 1e-6:
@@ -2383,59 +2369,96 @@ class PortfolioOptimizer:
         exposure = self._band_matrix @ w
         return bool(np.all(exposure >= self._band_lo - tol) and np.all(exposure <= self._band_hi + tol))
 
-    def max_sharpe(self, n_restarts: int = 3, seed: int = 11) -> pd.Series:
+    def max_sharpe(self) -> pd.Series:
         """
-        Resuelve el portafolio de máximo Sharpe Ratio (tangencia) bajo
-        restricciones long-only, límite máximo por activo y bandas por clase de
-        activo, usando SLSQP. La tasa libre de riesgo (rf) debe derivarse
+        Portafolio de máximo Sharpe (tangencia) long-only, con tope por activo y
+        bandas por clase de activo. La tasa libre de riesgo (rf) debe derivarse
         externamente (ej. de la curva TES o la IBR overnight).
 
-        El ratio de Sharpe no es convexo en w, y con muchos activos SLSQP puede
-        detenerse con 'positive directional derivative'. Ante un fallo se
-        reintenta desde puntos iniciales factibles aleatorios (`n_restarts`)
-        antes de caer al punto medio de las bandas.
+        El Sharpe no es cóncavo en w, pero con u = c·w/(μ−rf)'w (c > 0
+        arbitrario) el problema es un QP convexo (Cornuejols y Tütüncü, 2006):
+
+            min  u'Σu
+            s.t. (μ−rf)'u = c,  u ≥ 0
+                 min·Σu ≤ u_i ≤ max_i·Σu
+                 lo_g·Σu ≤ Σ_{i ∈ g} u_i ≤ hi_g·Σu
+
+        y w = u/Σu. Al ser convexo, SLSQP llega al óptimo global desde un solo
+        punto inicial: el portafolio factible de mayor exceso de retorno (LP).
+        Si ningún portafolio factible supera a rf no existe tangencia (el
+        cociente sería negativo para todos) y se devuelve el de mínima varianza.
         """
-        # --- Límites, restricciones y puntos iniciales ---
-        bounds = optimize.Bounds(self.min_weight, self.max_weights)
-        constraints = self._constraints()
-        w0 = self._initial_weights()
+        excess = self.mu_ - self.rf_log_
+        has_bands = len(self._band_matrix) > 0
 
-        rng = np.random.default_rng(seed)
-        starts = [w0] + [self._random_feasible_weights(rng) for _ in range(max(n_restarts, 0))]
+        # --- Punto inicial: portafolio factible de máximo exceso de retorno (LP) ---
+        lp = optimize.linprog(
+            -excess,
+            A_ub=np.vstack([self._band_matrix, -self._band_matrix]) if has_bands else None,
+            b_ub=np.concatenate([self._band_hi, -self._band_lo]) if has_bands else None,
+            A_eq=np.ones((1, self.n)), b_eq=[1.0],
+            bounds=np.column_stack([np.full(self.n, self.min_weight), self.max_weights]),
+        )
+        max_excess = -lp.fun if lp.success else 0.0
 
-        # --- Resolución con SLSQP (reinicios si no converge) ---
+        # --- QP convexo en u: topes, mínimos y bandas escalados por Σu ---
         best_w: Optional[np.ndarray] = None
-        for start in starts:
+        if max_excess <= 1e-12:
+            logger.warning("Max Sharpe: ningún portafolio factible supera la tasa libre de riesgo; "
+                           "se usa el de mínima varianza.")
+            best_w = self._min_variance_weights()
+        else:
+            ones, eye = np.ones((1, self.n)), np.eye(self.n)
+            homogeneous = np.vstack([
+                eye - self.min_weight * ones,
+                self.max_weights[:, None] * ones - eye,
+                self._band_matrix - self._band_lo[:, None] * ones,
+                self._band_hi[:, None] * ones - self._band_matrix,
+            ])
             result = optimize.minimize(
-                self._neg_sharpe,
-                start,
+                lambda u: u @ self.cov_ @ u,
+                lp.x,
+                jac=lambda u: 2.0 * self.cov_ @ u,
                 method="SLSQP",
-                bounds=bounds,
-                constraints=constraints,
+                bounds=optimize.Bounds(0.0, np.inf),
+                constraints=[
+                    optimize.LinearConstraint(excess[None, :], max_excess, max_excess),
+                    optimize.LinearConstraint(homogeneous, 0.0, np.inf),
+                ],
                 options={"maxiter": 1000, "ftol": 1e-12},
             )
             self.result_ = result
-            if not result.success:
-                continue
-            w = np.clip(result.x, 0.0, None)
-            total = w.sum()
-            if total <= 0:
-                continue
-            w = w / total
-            if self.is_feasible(w):
-                best_w = w
-                break
+            u = np.clip(result.x, 0.0, None)
+            if result.success and u.sum() > 0 and self.is_feasible(u / u.sum()):
+                best_w = u / u.sum()
 
         # --- Respaldo: punto medio factible de las bandas ---
         if best_w is None:
-            logger.warning(
-                "Max Sharpe: SLSQP no convergió en %d intentos. Usando el punto medio factible "
-                "de las bandas.", len(starts),
-            )
+            logger.warning("Max Sharpe: SLSQP no convergió. Usando el punto medio factible de las bandas.")
+            w0 = self._initial_weights()
             best_w = w0 / w0.sum()
 
-        # --- Salida ---
         return pd.Series(best_w, index=self.assets, name="max_sharpe")
+
+    # ------------------------------------------------------------------ #
+    def _min_variance_weights(self) -> Optional[np.ndarray]:
+        """Portafolio de mínima varianza dentro de topes y bandas (QP convexo); None si falla."""
+        constraints = [optimize.LinearConstraint(np.ones((1, self.n)), 1.0, 1.0)]
+        if len(self._band_matrix):
+            constraints.append(optimize.LinearConstraint(self._band_matrix, self._band_lo, self._band_hi))
+        result = optimize.minimize(
+            lambda w: w @ self.cov_ @ w,
+            self._initial_weights(),
+            jac=lambda w: 2.0 * self.cov_ @ w,
+            method="SLSQP",
+            bounds=optimize.Bounds(self.min_weight, self.max_weights),
+            constraints=constraints,
+            options={"maxiter": 1000, "ftol": 1e-12},
+        )
+        w = np.clip(result.x, 0.0, None)
+        if result.success and w.sum() > 0 and self.is_feasible(w / w.sum()):
+            return w / w.sum()
+        return None
 
     # ------------------------------------------------------------------ #
     # DIAGNÓSTICO DE LA SOLUCIÓN

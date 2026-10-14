@@ -93,7 +93,8 @@ Other details:
 - The covariance is estimated with **Ledoit-Wolf shrinkage** (scikit-learn), and the shrinkage intensity δ is reported.
 - Because moments are estimated on log returns, fixed-income μ and the risk-free rate are both converted to log scale, ln(1 + r).
 - **Equity and ETF μ use a Bayes-Stein estimator** (Jorion, 1986; `ESTIMADOR_MU`). Within each asset class, sample means are shrunk toward the mean of that class's minimum-variance portfolio, with an intensity φ estimated from the data. It approaches 1 when differences between sample means are mostly noise. φ is logged and averaged over the backtest. Set `ESTIMADOR_MU = "muestral"` to use plain sample means.
-- The problem is solved with SciPy SLSQP from a feasible starting point, with random feasible restarts if it fails. As a last resort it falls back to the midpoint of the bands.
+- The Sharpe ratio is not concave in the weights, so the problem is **reformulated as a convex QP** (Cornuejols and Tütüncü, 2006): minimize u'Σu subject to (μ−rf)'u = c, with caps and bands scaled by Σu, and w = u/Σu. SciPy SLSQP then reaches the global optimum from a single starting point, the feasible portfolio with the highest excess return (found with `linprog`).
+- **When no feasible portfolio beats the risk-free rate** (it happens in 16 of the 39 optimizations of the default 2021–2024 run), the Sharpe-optimal portfolio does not exist, and the engine returns the **minimum-variance portfolio** inside the caps and bands. If the solver fails, the last resort is the midpoint of the bands.
 - Infeasible bands are detected before calling the solver.
 - The efficient frontier plot uses 3,000 Monte Carlo portfolios drawn **inside the bands**.
 
