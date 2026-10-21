@@ -11,6 +11,7 @@ import ssl
 import sys
 import warnings
 import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
@@ -19,7 +20,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, 
 # --- Cómputo numérico y estadístico ------------------------------------------
 import numpy as np
 import pandas as pd
-from scipy import interpolate, optimize, signal
+from scipy import interpolate, optimize, signal, sparse
 from sklearn.covariance import LedoitWolf
 
 # --- Visualización ------------------------------------------------------------
@@ -93,9 +94,10 @@ CAPITAL_INVERSION_COP: Optional[float] = 100_000_000.0
 # ESA fecha.
 FECHA_FIN: Optional[str] = None
 
-# Años de historia hacia atrás. Sólo se usa si FECHA_INICIO es None. Debe ser mayor
-# que la ventana de estimación (sección 10): lo que sobra es el periodo del backtest.
-HISTORIA_ANIOS: float = 5.0
+# Años de historia hacia atrás. Sólo se usa si FECHA_INICIO es None. Debe cubrir al
+# menos la ventana del CVaR (CVAR_VENTANA_ANIOS, sección 8); en modo "validacion" lo que
+# sobra es el periodo del backtest.
+HISTORIA_ANIOS: float = 8.0
 
 # Fecha de inicio fija ("2021-01-01"). None = FECHA_FIN menos HISTORIA_ANIOS.
 FECHA_INICIO: Optional[str] = None
@@ -220,20 +222,38 @@ NODOS_TES: List[float] = [1.0, 3.0, 5.0, 10.0]
 #                 casi no se negocia. Por defecto 0.5.
 #   "sector"      Texto libre ("Soberano", "Financiero", "Utilities", ...). Sólo informativo.
 #
-# EJEMPLO (descomenta y reemplaza por datos reales; este ISIN y estas tasas son
-# inventados):
+# EJEMPLO. El primer bono es real en lo que se pudo verificar en fuentes del Ministerio
+# de Hacienda: TES en pesos emitido el 27-feb-2025 con vencimiento el 27-feb-2030 y
+# cupón de 12,50%. NO se pudo verificar su ISIN ni la tasa de hoy: el "isin" es un
+# marcador que debes reemplazar por el ISIN real, y la "ytm" (14,79%) es el corte de
+# la subasta de mayo de 2026, no la de tu fecha de datos. Actualiza ambos antes de usarlo.
+# La plantilla de abajo (comentada) sirve para agregar más bonos; los datos de ISIN,
+# cupón, vencimiento y tasa los consigues en el informe de la subasta de TES del
+# Ministerio de Hacienda, en la BVC o con tu comisionista (Precia / PiP).
 BONOS_UNIVERSO: List[Dict[str, object]] = [
+    {
+        "isin": "REEMPLAZAR-ISIN-TES-2030-02-27",
+        "emisor": "Ministerio de Hacienda (TES)",
+        "rating": "AAA",
+        "cupon": 0.1250,
+        "vencimiento": "2030-02-27",
+        "ytm": 0.1479,
+        "frecuencia": 1,
+        "indexacion": "TF",
+        "liquidez": 0.95,
+        "sector": "Soberano",
+    },
     # {
-    #     "isin": "COL17CT02622",
-    #     "emisor": "Ministerio de Hacienda (TES)",
+    #     "isin": "ISIN-DEL-BONO",
+    #     "emisor": "Nombre del emisor",
     #     "rating": "AAA",
-    #     "cupon": 0.0700,
-    #     "vencimiento": "2031-06-30",
-    #     "ytm": 0.1050,
+    #     "cupon": 0.0000,            # decimal, tasa cupón efectiva anual
+    #     "vencimiento": "AAAA-MM-DD",
+    #     "ytm": 0.0000,              # o "precio" (sucio, por 100) o "spread_bp"
     #     "frecuencia": 1,
     #     "indexacion": "TF",
-    #     "liquidez": 0.90,
-    #     "sector": "Soberano",
+    #     "liquidez": 0.5,
+    #     "sector": "Financiero",
     # },
 ]
 
@@ -306,11 +326,27 @@ PREGUNTAR_ANTES_DE_OPTIMIZAR: bool = True
 # --- CVaR (pérdida esperada en la cola) ---------------------------------------
 CVAR_NIVEL: float = 0.95               # 0.95 = promedio del peor 5% de los casos.
 HORIZONTE_DIAS: int = 21               # Horizonte del portafolio en días hábiles (21 ≈ 1 mes).
-FRECUENCIA_RETORNOS_CVAR: str = "diaria"  # Retornos continuos con que se arman los escenarios: "diaria" o "semanal".
-                                       # Con "semanal" hay menos escenarios (~100 en 2 años): la cola es poco confiable.
-CVAR_CENTRAR_EN_MU: bool = True        # True: los escenarios se recentran en el retorno esperado usado por el
+
+# Historia con que se estima la cola. Es más larga que la ventana de retorno y
+# covarianza (LOOKBACK_DIAS, sección 10) porque la cola del 5% necesita muchas
+# observaciones. Con 5 años hay ~1.260 retornos diarios y ~63 caen en la cola; se
+# recomienda al menos CVAR_MIN_OBS_COLA observaciones en la cola (30 -> 2,4 años
+# diarios; con retornos semanales harían falta más de 11 años). Los activos que no
+# tengan esta historia quedan fuera del universo (el reporte los lista).
+CVAR_VENTANA_ANIOS: float = 5.0
+CVAR_MIN_OBS_COLA: int = 30
+FRECUENCIA_RETORNOS_CVAR: str = "diaria"  # Retornos continuos de los escenarios: "diaria" o "semanal" (poco confiable: 5 años = 260 datos).
+
+# Los escenarios mensuales se simulan con bootstrap por bloques: se toman bloques de
+# retornos diarios reales (conservan correlaciones y rachas de volatilidad) y se
+# encadenan hasta completar el horizonte. Así el CVaR se apoya en toda la historia
+# y no en ~60 meses solapados.
+CVAR_ESCENARIOS: int = 3000            # Trayectorias simuladas (más = menos ruido de simulación, más lento).
+CVAR_BLOQUE_DIAS: int = 5              # Largo medio de cada bloque, en días.
+CVAR_REMUESTREOS_IC: int = 200         # Remuestreos para el intervalo de confianza del CVaR en el reporte.
+CVAR_CENTRAR_EN_MU: bool = True        # True: los retornos se recentran en el retorno esperado usado por el
                                        # optimizador, para no heredar la tendencia pasada (p. ej. una acción que
-                                       # subió mucho). False: escenarios históricos tal cual.
+                                       # subió mucho). False: historia tal cual.
 
 # ------------------------------------------------------------------------------
 # 9. RESTRICCIONES DEL PORTAFOLIO (LIBRES POR DEFECTO)
@@ -338,13 +374,33 @@ TOPES_POR_TIPO: Dict[str, Optional[float]] = {
     "bono": None,
 }
 
+# --- Número de activos del portafolio ------------------------------------------
+# Un óptimo sin límites puede dejar posiciones diminutas (decenas de activos con 0,5%) que no
+# se pueden operar de forma práctica, o al revés, concentrarse en 1 o 2 activos. Estos
+# parámetros controlan cuántos activos entran.
+MIN_ACTIVOS: Optional[int] = 5                 # Mínimo de activos: ningún activo pasará de 1/MIN_ACTIVOS (5 -> 20%). None = sin mínimo.
+MAX_ACTIVOS: Optional[int] = 12                # Máximo de activos (10 a 15 es razonable). None = sin límite.
+PESO_MIN_POSICION: Optional[float] = 0.03      # Peso mínimo de cada activo elegido (0.03 = 3%). None = sin mínimo.
+
+# Cantidad óptima automática: de los portafolios con entre MIN_ACTIVOS y MAX_ACTIVOS activos se
+# toma el que tenga MENOS activos y cuyo objetivo (Sharpe, volatilidad, CVaR o retorno, según el
+# criterio) quede a menos de CARDINALIDAD_TOLERANCIA del mejor. El reporte grafica el objetivo
+# contra el número de activos para que veas cuánto cuesta cada activo de menos. False = usa el
+# portafolio con más activos permitidos (el de mejor objetivo).
+# El máximo y el peso mínimo se resuelven con una heurística (se resuelve el óptimo libre y se
+# van eliminando los activos de menor peso, re-optimizando): buenas soluciones, pero sin
+# garantía de óptimo global, porque el problema es combinatorio.
+CARDINALIDAD_AUTOMATICA: bool = True
+CARDINALIDAD_TOLERANCIA: float = 0.02          # 0.02 = acepta perder hasta 2% del objetivo por tener menos activos.
+
 # Peso mínimo (%) para que un activo aparezca en las tablas de resultados.
-PESO_MIN_REPORTE_PCT: float = 0.5
+PESO_MIN_REPORTE_PCT: float = 0.1
 
 # ------------------------------------------------------------------------------
 # 10. ESTIMACIÓN DE RETORNOS Y RIESGO
 # ------------------------------------------------------------------------------
-LOOKBACK_DIAS: int = 504              # Días hábiles de historia para estimar (504 ≈ 2 años).
+LOOKBACK_DIAS: int = 504              # Días hábiles de historia para estimar retorno y covarianza (504 ≈ 2 años).
+                                      # La cola del CVaR usa una ventana más larga: ver CVAR_VENTANA_ANIOS.
 USAR_SHRINKAGE_LEDOIT_WOLF: bool = True  # Suaviza la matriz de covarianza (recomendado).
 ESTIMADOR_MU: str = "bayes_stein"     # Retorno esperado de acciones/ETFs: "bayes_stein" o "muestral".
 
@@ -2378,8 +2434,27 @@ class ObjectiveSpec:
     horizon_days: int = field(default_factory=lambda: HORIZONTE_DIAS)
     return_freq: str = field(default_factory=lambda: FRECUENCIA_RETORNOS_CVAR)
     center_on_mu: bool = field(default_factory=lambda: CVAR_CENTRAR_EN_MU)
+    n_scenarios: int = field(default_factory=lambda: CVAR_ESCENARIOS)
+    block_days: int = field(default_factory=lambda: CVAR_BLOQUE_DIAS)
+    seed: int = field(default_factory=lambda: SEMILLA_ALEATORIA)
+    # --- Número de activos ---
+    max_assets: Optional[int] = field(default_factory=lambda: MAX_ACTIVOS)
+    min_position: Optional[float] = field(default_factory=lambda: PESO_MIN_POSICION)
+    auto_assets: bool = field(default_factory=lambda: CARDINALIDAD_AUTOMATICA)
+    auto_tolerance: float = field(default_factory=lambda: CARDINALIDAD_TOLERANCIA)
+    min_assets: Optional[int] = field(default_factory=lambda: MIN_ACTIVOS)
 
     def __post_init__(self) -> None:
+        if self.max_assets is not None and self.max_assets < 1:
+            raise ValueError("MAX_ACTIVOS debe ser al menos 1 o None.")
+        if self.min_assets is not None and self.min_assets < 1:
+            raise ValueError("MIN_ACTIVOS debe ser al menos 1 o None.")
+        if self.min_assets and self.max_assets and self.min_assets > self.max_assets:
+            raise ValueError(f"MIN_ACTIVOS ({self.min_assets}) no puede superar MAX_ACTIVOS ({self.max_assets}).")
+        if self.min_position is not None and not 0.0 < self.min_position < 1.0:
+            raise ValueError("PESO_MIN_POSICION debe estar en (0, 1) o ser None.")
+        if self.n_scenarios < 200:
+            raise ValueError("CVAR_ESCENARIOS debe ser al menos 200.")
         if self.criterion not in CRITERIOS_OPTIMIZACION:
             raise ValueError(f"CRITERIO_OPTIMIZACION debe ser uno de {list(CRITERIOS_OPTIMIZACION)}, "
                              f"no '{self.criterion}'.")
@@ -2393,6 +2468,11 @@ class ObjectiveSpec:
     @property
     def label(self) -> str:
         return CRITERIOS_OPTIMIZACION[self.criterion]
+
+    @property
+    def limits_assets(self) -> bool:
+        return (self.max_assets is not None or self.min_position is not None
+                or self.min_assets is not None)
 
     @property
     def needs_vol(self) -> bool:
@@ -2445,6 +2525,7 @@ class PortfolioOptimizer:
         group_constraints: Optional[Sequence[GroupConstraint]] = None,
         expected_returns: Optional[Union[pd.Series, Mapping[str, float]]] = None,
         mu_estimator: Optional[str] = None,
+        tail_returns: Optional[pd.DataFrame] = None,
     ) -> None:
         # --- Validación de entradas y estimador de μ ---
         if returns.empty:
@@ -2456,6 +2537,9 @@ class PortfolioOptimizer:
         # --- Datos base y parámetros ---
         self.returns = returns.dropna(how="any")
         self.assets = list(self.returns.columns)
+        # Historia más larga para la cola del CVaR (si no se da, la misma ventana de estimación)
+        self.tail_returns = (tail_returns[self.assets].dropna(how="any")
+                             if tail_returns is not None else self.returns)
         self.n = len(self.assets)
         self.rf = rf
         self.rf_log_ = float(np.log1p(rf))
@@ -2723,44 +2807,113 @@ class PortfolioOptimizer:
         return self._minimize_quadratic(self.cov_, np.zeros(self.n), start=self._initial_weights())
 
     # ------------------------------------------------------------------ #
-    # ESCENARIOS Y CVaR (SIMULACIÓN HISTÓRICA)
+    # ESCENARIOS Y CVaR (BOOTSTRAP POR BLOQUES SOBRE LA HISTORIA DE LA COLA)
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _bootstrap_paths(
+        X: np.ndarray, steps: int, mean_block: int, n_paths: int, rng: np.random.Generator
+    ) -> np.ndarray:
+        """
+        Bootstrap estacionario (Politis-Romano): cada trayectoria encadena
+        `steps` retornos de las filas de X; en cada paso sigue con la fila
+        siguiente (continúa el bloque) o, con probabilidad 1/mean_block,
+        salta a una fila al azar. Devuelve la suma de cada trayectoria
+        (n_paths x activos). Conserva correlaciones entre activos y rachas.
+        """
+        T = X.shape[0]
+        idx = np.empty((n_paths, steps), dtype=np.int64)
+        idx[:, 0] = rng.integers(0, T, n_paths)
+        for t in range(1, steps):
+            jump = rng.random(n_paths) < 1.0 / max(mean_block, 1)
+            idx[:, t] = np.where(jump, rng.integers(0, T, n_paths), (idx[:, t - 1] + 1) % T)
+        return X[idx].sum(axis=1)
+
+    # ------------------------------------------------------------------ #
+    def _tail_matrix(self, spec: ObjectiveSpec) -> Tuple[np.ndarray, int, int]:
+        """Retornos de la ventana de la cola en la frecuencia pedida: (matriz, periodos/año, bloque)."""
+        r = self.tail_returns
+        periods = self.trading_days
+        if spec.return_freq == "semanal":
+            r = r.resample("W-FRI").sum()
+            periods = 52
+        X = r.to_numpy()
+        if spec.center_on_mu:
+            X = X - X.mean(axis=0) + self.mu_ / periods
+        block = max(int(round(spec.block_days * periods / self.trading_days)), 1)
+        return X, periods, block
+
     # ------------------------------------------------------------------ #
     def scenarios(self, spec: ObjectiveSpec) -> np.ndarray:
         """
         Matriz (escenarios x activos) de retornos simples al horizonte del
-        portafolio. Se arma con los retornos continuos de la ventana
-        (diarios o semanales) sumados en ventanas móviles que cubren el
-        horizonte; con `center_on_mu` se recentran en el retorno esperado del
-        optimizador para que el CVaR sea coherente con el μ que se está usando.
+        portafolio, simulada por bootstrap por bloques de los retornos
+        continuos de la ventana de la cola (diarios o semanales), recentrados
+        en μ si `center_on_mu`. Es determinista (semilla fija).
         """
-        key = (spec.return_freq, spec.horizon_days, spec.center_on_mu)
+        key = (spec.return_freq, spec.horizon_days, spec.center_on_mu, spec.n_scenarios, spec.block_days, spec.seed)
         if getattr(self, "_scenario_key", None) == key:
             return self._scenario_cache
-
-        r = self.returns
-        periods_per_year = self.trading_days
-        if spec.return_freq == "semanal":
-            r = r.resample("W-FRI").sum()
-            periods_per_year = 52
-        k = max(int(round(spec.horizon_days * periods_per_year / self.trading_days)), 1)
-        horizon_log = r.rolling(k).sum().dropna().to_numpy()
-        if len(horizon_log) < 30:
-            raise ValueError(
-                f"Sólo {len(horizon_log)} escenarios para el CVaR (ventana demasiado corta para "
-                f"el horizonte); amplía LOOKBACK_DIAS o usa FRECUENCIA_RETORNOS_CVAR = 'diaria'."
-            )
-        if spec.center_on_mu:
-            horizon_log = horizon_log - horizon_log.mean(axis=0) + self.mu_ * (k / periods_per_year)
-        self._scenario_key, self._scenario_cache = key, np.expm1(horizon_log)
+        X, periods, block = self._tail_matrix(spec)
+        steps = max(int(round(spec.horizon_days * periods / self.trading_days)), 1)
+        paths = self._bootstrap_paths(X, steps, block, spec.n_scenarios, np.random.default_rng(spec.seed))
+        self._scenario_key, self._scenario_cache = key, np.expm1(paths)
         return self._scenario_cache
 
     # ------------------------------------------------------------------ #
+    def tail_diagnostics(self, spec: ObjectiveSpec) -> Dict[str, float]:
+        """Cuánta información respalda la cola: observaciones, años y observaciones en la cola."""
+        periods = 52 if spec.return_freq == "semanal" else self.trading_days
+        n_obs = len(self.tail_returns) if spec.return_freq == "diaria" else len(
+            self.tail_returns.resample("W-FRI").sum())
+        tail = n_obs * (1.0 - spec.cvar_level)
+        return {
+            "observaciones": float(n_obs), "anios": n_obs / periods, "obs_en_la_cola": tail,
+            "anios_minimos": (CVAR_MIN_OBS_COLA / (1.0 - spec.cvar_level)) / periods,
+        }
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _cvar_from_losses(losses: np.ndarray, level: float) -> Tuple[float, float]:
+        var = float(np.quantile(losses, level))
+        return float(losses[losses >= var].mean()), var
+
     def cvar_var(self, w: np.ndarray, spec: ObjectiveSpec) -> Tuple[float, float]:
         """(CVaR, VaR) de pérdida al horizonte, como fracción positiva del portafolio."""
-        losses = -(self.scenarios(spec) @ np.asarray(w, dtype=float))
-        var = float(np.quantile(losses, spec.cvar_level))
-        tail = losses[losses >= var]
-        return float(tail.mean()), var
+        return self._cvar_from_losses(-(self.scenarios(spec) @ np.asarray(w, dtype=float)), spec.cvar_level)
+
+    # ------------------------------------------------------------------ #
+    def cvar_interval(
+        self, w: np.ndarray, spec: ObjectiveSpec, n_boot: Optional[int] = None, confidence: float = 0.90
+    ) -> Tuple[float, float]:
+        """
+        Intervalo de confianza del CVaR por remuestreo: se remuestrea la propia
+        historia de la cola (bootstrap por bloques), se vuelve a simular el
+        CVaR con cada remuestreo y se toman los percentiles. Un intervalo ancho
+        indica que la historia no basta para fijar la cola.
+        """
+        n_boot = CVAR_REMUESTREOS_IC if n_boot is None else n_boot
+        w = np.asarray(w, dtype=float)
+        X, periods, block = self._tail_matrix(spec)
+        steps = max(int(round(spec.horizon_days * periods / self.trading_days)), 1)
+        rng = np.random.default_rng(spec.seed + 1)
+        values = []
+        for _ in range(n_boot):
+            rows = self._bootstrap_rows(X.shape[0], block, rng)
+            paths = self._bootstrap_paths(X[rows], steps, block, 1000, rng)
+            values.append(self._cvar_from_losses(-(np.expm1(paths) @ w), spec.cvar_level)[0])
+        lo, hi = np.quantile(values, [(1 - confidence) / 2, (1 + confidence) / 2])
+        return float(lo), float(hi)
+
+    @staticmethod
+    def _bootstrap_rows(T: int, mean_block: int, rng: np.random.Generator) -> np.ndarray:
+        """Índices de una historia remuestreada (bootstrap estacionario) del mismo largo T."""
+        idx = np.empty(T, dtype=np.int64)
+        idx[0] = rng.integers(0, T)
+        jumps = rng.random(T) < 1.0 / max(mean_block, 1)
+        starts = rng.integers(0, T, T)
+        for t in range(1, T):
+            idx[t] = starts[t] if jumps[t] else (idx[t - 1] + 1) % T
+        return idx
 
     # ------------------------------------------------------------------ #
     def _lp_constraints(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
@@ -2775,34 +2928,38 @@ class PortfolioOptimizer:
         self, spec: ObjectiveSpec, maximize_return: bool, cvar_cap: Optional[float] = None
     ) -> Optional[np.ndarray]:
         """
-        Programa lineal de Rockafellar-Uryasev sobre los escenarios históricos.
+        Programa lineal de Rockafellar-Uryasev sobre los escenarios simulados.
         Variables x = [w (n), α (1), z (S)] con CVaR = α + Σz / ((1−β)·S):
 
             min  CVaR                       (maximize_return = False)
             max  μ'w  s.t.  CVaR ≤ cvar_cap (maximize_return = True)
             s.t. z_s ≥ −R_s·w − α,  z ≥ 0,  Σw = 1, topes y bandas.
+
+        Matrices dispersas: con miles de escenarios el bloque de pérdidas es casi vacío.
         """
         R = self.scenarios(spec)
         S, n = R.shape
         tail = 1.0 / ((1.0 - spec.cvar_level) * S)
         cvar_row = np.concatenate([np.zeros(n), [1.0], np.full(S, tail)])
 
-        loss_rows = np.hstack([-R, -np.ones((S, 1)), -np.eye(S)])
-        a_ub, b_ub = [loss_rows], [np.zeros(S)]
+        blocks = [sparse.hstack([sparse.csr_matrix(-R), sparse.csr_matrix(-np.ones((S, 1))),
+                                 -sparse.identity(S, format="csr")], format="csr")]
+        rhs = [np.zeros(S)]
         band_a, band_b = self._lp_constraints()
         if band_a is not None:
-            a_ub.append(np.hstack([band_a, np.zeros((len(band_a), 1 + S))]))
-            b_ub.append(band_b)
+            blocks.append(sparse.hstack([sparse.csr_matrix(band_a), sparse.csr_matrix((len(band_a), 1 + S))],
+                                        format="csr"))
+            rhs.append(band_b)
         if maximize_return:
-            a_ub.append(cvar_row[None, :])
-            b_ub.append([cvar_cap])
+            blocks.append(sparse.csr_matrix(cvar_row[None, :]))
+            rhs.append(np.array([cvar_cap]))
             cost = np.concatenate([-self.mu_, np.zeros(1 + S)])
         else:
             cost = cvar_row
 
         res = optimize.linprog(
-            cost, A_ub=np.vstack(a_ub), b_ub=np.concatenate(b_ub),
-            A_eq=np.concatenate([np.ones(n), np.zeros(1 + S)])[None, :], b_eq=[1.0],
+            cost, A_ub=sparse.vstack(blocks, format="csr"), b_ub=np.concatenate(rhs),
+            A_eq=sparse.csr_matrix(np.concatenate([np.ones(n), np.zeros(1 + S)])[None, :]), b_eq=[1.0],
             bounds=[(self.min_weight, float(m)) for m in self.max_weights] + [(None, None)] + [(0, None)] * S,
             method="highs",
         )
@@ -2888,7 +3045,8 @@ class PortfolioOptimizer:
         alcanzables de volatilidad anual y CVaR al horizonte: del mínimo (el
         portafolio que lo minimiza) al valor del portafolio de máximo retorno.
         """
-        refs = self.reference_portfolios(spec)
+        with self.diversified(spec):
+            refs = self.reference_portfolios(spec)
         self.reference_weights_ = refs
         table = pd.DataFrame({name: self.measures(w, spec) for name, w in refs.items()}).T
         ranges = {
@@ -2900,15 +3058,28 @@ class PortfolioOptimizer:
         return table, ranges
 
     # ------------------------------------------------------------------ #
+    def _range_for(self, key: str, spec: ObjectiveSpec) -> Tuple[float, float]:
+        """Rango alcanzable de 'vol' o 'cvar' (sólo lo necesario, más barato que `achievable_ranges`)."""
+        w_max = self._max_return_weights()
+        if key == "vol":
+            w_min = self._min_variance_weights()
+            w_min = w_min if w_min is not None else self._initial_weights()
+            return self._portfolio_perf(w_min)[1], self._portfolio_perf(w_max)[1]
+        w_min = self._cvar_lp(spec, maximize_return=False)
+        w_min = w_min if w_min is not None else self._initial_weights()
+        return self.cvar_var(w_min, spec)[0], self.cvar_var(w_max, spec)[0]
+
+    # ------------------------------------------------------------------ #
     def optimize(
         self, spec: ObjectiveSpec, ranges: Optional[Dict[str, Tuple[float, float]]] = None
     ) -> Tuple[pd.Series, Dict[str, object]]:
         """
-        Resuelve el criterio pedido. Si un objetivo cae fuera del rango
-        alcanzable se usa el valor factible más cercano (y se informa); si no se
-        dio objetivo, el punto medio del rango. Retorna (pesos, info).
+        Resuelve el criterio pedido sobre el universo vigente (sin límite de
+        número de activos; para eso está `solve`). Si un objetivo cae fuera del
+        rango alcanzable se usa el valor factible más cercano (y se informa); si
+        no se dio objetivo, el punto medio del rango. Retorna (pesos, info).
         """
-        info: Dict[str, object] = {"criterio": spec.label, "nota": ""}
+        info: Dict[str, object] = {"criterio": spec.label, "nota": "", "resuelto": True}
         w: Optional[np.ndarray] = None
 
         if spec.criterion == "max_sharpe":
@@ -2918,10 +3089,8 @@ class PortfolioOptimizer:
         elif spec.criterion == "min_cvar":
             w = self._cvar_lp(spec, maximize_return=False)
         else:
-            if ranges is None:
-                ranges = self.achievable_ranges(spec)[1]
             key, target = ("vol", spec.vol_target) if spec.needs_vol else ("cvar", spec.cvar_target)
-            lo, hi = ranges[key]
+            lo, hi = ranges[key] if ranges is not None else self._range_for(key, spec)
             used = (lo + hi) / 2.0 if target is None else float(np.clip(target, lo, hi))
             unit = "volatilidad anual" if key == "vol" else "CVaR"
             if target is None:
@@ -2938,11 +3107,138 @@ class PortfolioOptimizer:
         if w is None:
             logger.warning("%s: el solver no encontró solución; se usa la mínima varianza.", spec.label)
             info["nota"] = (info["nota"] + " El solver no convergió: se usó la mínima varianza.").strip()
+            info["resuelto"] = False
             w = self._min_variance_weights()
             if w is None:
                 w = self._initial_weights()
         w = np.clip(w, 0.0, None) / np.clip(w, 0.0, None).sum()
         return pd.Series(w, index=self.assets, name=spec.criterion), info
+
+    # ------------------------------------------------------------------ #
+    # NÚMERO DE ACTIVOS (HEURÍSTICA DE CARDINALIDAD)
+    # ------------------------------------------------------------------ #
+    def score(self, w: np.ndarray, spec: ObjectiveSpec) -> float:
+        """Valor del objetivo del criterio (mayor es mejor)."""
+        ret, vol = self._portfolio_perf(w)
+        if spec.criterion == "max_sharpe":
+            return (ret - self.rf_log_) / vol if vol > 0 else 0.0
+        if spec.criterion == "min_varianza":
+            return -vol
+        if spec.criterion == "min_cvar":
+            return -self.cvar_var(w, spec)[0]
+        return ret
+
+    # ------------------------------------------------------------------ #
+    def solve(
+        self, spec: ObjectiveSpec, ranges: Optional[Dict[str, Tuple[float, float]]] = None
+    ) -> Tuple[pd.Series, Dict[str, object]]:
+        """`optimize` más los límites de número de activos y de peso mínimo, si están activos."""
+        if not spec.limits_assets:
+            return self.optimize(spec, ranges)
+        with self.diversified(spec):
+            return self._solve_cardinality(spec, ranges)
+
+    # ------------------------------------------------------------------ #
+    @contextmanager
+    def diversified(self, spec: ObjectiveSpec):
+        """
+        Aplica el mínimo de activos como tope por activo de 1/N mientras dure el
+        bloque (al menos N activos <=> ninguno pasa de 1/N) y luego restaura los topes.
+        """
+        original = self.max_weights.copy()
+        try:
+            if spec.min_assets:
+                self.max_weights = np.minimum(self.max_weights, 1.0 / spec.min_assets)
+                if self.max_weights.sum() < 1.0 - 1e-9:
+                    raise ValueError(f"MIN_ACTIVOS = {spec.min_assets} no se puede cumplir con sólo "
+                                     f"{self.n} activos invertibles.")
+            yield
+        finally:
+            self.max_weights = original
+
+    # ------------------------------------------------------------------ #
+    def _solve_cardinality(
+        self, spec: ObjectiveSpec, ranges: Optional[Dict[str, Tuple[float, float]]]
+    ) -> Tuple[pd.Series, Dict[str, object]]:
+        """
+        Heurística de eliminación hacia atrás: se resuelve el óptimo libre y,
+        mientras haya más activos que `max_assets` o posiciones menores a
+        `min_position`, se elimina el de menor peso (varios a la vez si faltan
+        muchos) y se re-optimiza sin él. En modo automático se sigue
+        eliminando hasta `min_assets` para trazar cómo cambia el objetivo
+        con el número de activos, y se elige el portafolio con menos activos
+        cuyo objetivo está a menos de `auto_tolerance` del mejor.
+
+        No garantiza el óptimo global (el problema es combinatorio), pero cada
+        paso es un problema convexo resuelto con los mismos solvers.
+        """
+        eps = 1e-4
+        caps = self.max_weights.copy()
+        max_k = spec.max_assets or self.n
+        w_min = spec.min_position or 0.0
+        floor_k = max(spec.min_assets or 1, 1) if spec.auto_assets else 1
+        path: Dict[int, Tuple[np.ndarray, bool]] = {}
+        protected: Set[int] = set()
+        notes: List[str] = []
+
+        def record(w: np.ndarray) -> None:
+            sel = w > eps
+            k = int(sel.sum())
+            path[k] = (w.copy(), k <= max_k and bool(np.all(w[sel] >= w_min - 1e-6)))
+
+        try:
+            w_series, info = self.optimize(spec, ranges)
+            w = w_series.to_numpy()
+            record(w)
+            while True:
+                sel = np.flatnonzero(w > eps)
+                k = len(sel)
+                too_small = bool(w_min) and bool(np.any(w[sel] < w_min - 1e-6))
+                if k <= 1 or not (k > max_k or too_small or (spec.auto_assets and k > floor_k)):
+                    break
+                order = [i for i in sel[np.argsort(w[sel])] if i not in protected]
+                if not order:
+                    break
+                excess = k - max_k
+                dropped = order[: max(1, excess // 2) if excess > 4 else 1]
+                saved = self.max_weights.copy()
+                self.max_weights[dropped] = 0.0
+                w_new, info_new = self.optimize(spec, None)
+                w_new = w_new.to_numpy()
+                if not info_new["resuelto"] or not self.is_feasible(w_new):
+                    self.max_weights = saved          # sin ese activo no hay solución (p. ej. una banda): se protege
+                    protected.update(dropped)
+                    continue
+                w = w_new
+                record(w)
+        finally:
+            self.max_weights = caps
+
+        valid = {k: w for k, (w, ok) in path.items() if ok}
+        curve = pd.DataFrame({
+            k: {"score": self.score(w, spec), **self.measures(w, spec)} for k, w in sorted(valid.items())
+        }).T
+        curve.index.name = "activos"
+        if not valid:
+            chosen_k = min(path)
+            chosen = path[chosen_k][0]
+            notes.append(f"No se logró cumplir los límites de activos ({max_k}) y peso mínimo "
+                         f"({w_min:.0%}); se dejó el portafolio con {chosen_k} activos.")
+        elif spec.auto_assets:
+            best = float(curve["score"].max())
+            ok_k = [k for k, sc in curve["score"].items() if sc >= best - spec.auto_tolerance * abs(best) - 1e-12]
+            chosen_k = int(min(ok_k))
+            chosen = valid[chosen_k]
+            notes.append(f"Cantidad automática de activos: {chosen_k} (con {int(curve.index.max())} "
+                         f"el objetivo mejora menos de {spec.auto_tolerance:.0%}).")
+        else:
+            chosen_k = int(max(valid))
+            chosen = valid[chosen_k]
+
+        info["nota"] = " ".join(x for x in [str(info["nota"])] + notes if x).strip()
+        info["curva_activos"] = curve
+        info["activos_elegidos"] = chosen_k
+        return pd.Series(chosen, index=self.assets, name=spec.criterion), info
 
     # ------------------------------------------------------------------ #
     # DIAGNÓSTICO DE LA SOLUCIÓN
@@ -3104,9 +3400,12 @@ class WalkForwardBacktester:
         exclude_fn: Optional[Callable[[pd.Timestamp, pd.Timestamp], Set[str]]] = None,
         window_fn: Optional[Callable[[pd.Timestamp, pd.DataFrame], pd.DataFrame]] = None,
         objective: Optional[ObjectiveSpec] = None,
+        cvar_lookback_days: Optional[int] = None,
     ) -> None:
         # --- Datos y parámetros del backtest ---
         self.objective = objective or ObjectiveSpec()
+        # Ventana larga (cola del CVaR); la de retorno y covarianza es `lookback_days`.
+        self.cvar_lookback_days = max(cvar_lookback_days or 0, lookback_days)
         self.prices = prices.dropna(how="all")
         self.returns = MarketDataPipeline.compute_returns(self.prices)
         self.lookback_days = lookback_days
@@ -3145,15 +3444,15 @@ class WalkForwardBacktester:
     # ------------------------------------------------------------------ #
     def _rebalance_dates(self) -> List[pd.Timestamp]:
         idx = self.returns.index
-        if len(idx) < self.lookback_days:
+        if len(idx) < self.cvar_lookback_days:
             return []
         dates = pd.Series(idx, index=idx).resample(self.rebalance_freq).last().dropna()
-        return [pd.Timestamp(d) for d in dates[dates >= idx[self.lookback_days - 1]]]
+        return [pd.Timestamp(d) for d in dates[dates >= idx[self.cvar_lookback_days - 1]]]
 
     # ------------------------------------------------------------------ #
     def _in_sample(self, reb_date: pd.Timestamp) -> pd.DataFrame:
-        """Ventana de estimación con sólo los activos invertibles en `reb_date`."""
-        window = self.returns.loc[:reb_date].tail(self.lookback_days)
+        """Ventana larga (cola del CVaR) con sólo los activos invertibles en `reb_date`."""
+        window = self.returns.loc[:reb_date].tail(self.cvar_lookback_days)
         excluded = set(self.exclude_fn(reb_date, window.index[0])) if self.exclude_fn else set()
         excluded |= set(window.columns[window.isna().any()])
         self.excluded_history_[reb_date] = excluded & set(window.columns)
@@ -3173,9 +3472,10 @@ class WalkForwardBacktester:
         mu_override = self.expected_returns_fn(reb_date) if self.expected_returns_fn else None
         rf_t = self.rf_fn(reb_date) if self.rf_fn else self.rf
 
-        # --- Optimizador ---
+        # --- Optimizador: retorno y covarianza con la ventana corta, cola con la larga ---
         return PortfolioOptimizer(
-            window_returns,
+            window_returns.tail(self.lookback_days),
+            tail_returns=window_returns,
             rf=rf_t,
             max_weight=self.max_weight,
             shrinkage=self.shrinkage,
@@ -3190,7 +3490,7 @@ class WalkForwardBacktester:
     ) -> Tuple[pd.Series, float]:
         opt = self._build_optimizer(window_returns, reb_date)
         self.mu_shrinkage_history_[reb_date] = dict(opt.mu_shrinkage_)
-        weights, _ = opt.optimize(self.objective)
+        weights, _ = opt.solve(self.objective)
         return weights, opt.rf
 
     # ------------------------------------------------------------------ #
@@ -3827,6 +4127,25 @@ def _fig_distribucion(dist_subclase: pd.DataFrame) -> go.Figure:
     return fig
 
 
+def _fig_curva_activos(curva: pd.DataFrame, elegido: int, spec: ObjectiveSpec) -> go.Figure:
+    """Cómo cambia el objetivo del criterio al variar el número de activos; marca el elegido."""
+    columna, titulo, formato = {
+        "max_sharpe": ("sharpe", "Sharpe esperado", ".2f"),
+        "min_varianza": ("volatilidad_anual", "Volatilidad anual", ".2%"),
+        "min_cvar": ("cvar_horizonte", f"CVaR {spec.cvar_level:.0%} a {spec.horizon_days} días", ".2%"),
+    }.get(spec.criterion, ("retorno_esperado_anual", "Retorno esperado (E.A.)", ".2%"))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=curva.index, y=curva[columna], mode="lines+markers", name=titulo,
+                             line=dict(color="#2E6F9E")))
+    if elegido in curva.index:
+        fig.add_trace(go.Scatter(x=[elegido], y=[curva.loc[elegido, columna]], mode="markers",
+                                 name=f"Elegido: {elegido} activos",
+                                 marker=dict(symbol="star", size=18, color="red")))
+    fig.update_layout(xaxis_title="Número de activos", yaxis_title=titulo, yaxis_tickformat=formato,
+                      xaxis=dict(dtick=1), height=380)
+    return fig
+
+
 def main() -> None:
     # ---------------------------------------------------------------- #
     # 0) CONFIGURACIÓN: MODO, VENTANA, BONOS Y POLÍTICA
@@ -3849,6 +4168,15 @@ def main() -> None:
         logger.warning(msg)
         alertas.append(msg)
     logger.info("Ventana de datos: %s a %s.", start_date, end_date)
+    anios_datos = (pd.Timestamp(end_date) - pd.Timestamp(start_date)).days / 365.25
+    if anios_datos < CVAR_VENTANA_ANIOS:
+        raise ValueError(
+            f"La ventana de datos ({anios_datos:.1f} años) es menor que la ventana del CVaR "
+            f"({CVAR_VENTANA_ANIOS:g} años): sube HISTORIA_ANIOS o baja CVAR_VENTANA_ANIOS."
+        )
+    if modo_validacion and anios_datos < CVAR_VENTANA_ANIOS + 1:
+        logger.warning("Quedan menos de 1 año de datos para el backtest (%.1f años de datos, %g de ventana).",
+                       anios_datos, CVAR_VENTANA_ANIOS)
 
     # --- Bonos individuales ingresados por el usuario (se validan antes de descargar nada) ---
     bonos = BondSpec.list_from_config(BONOS_UNIVERSO, end_date)
@@ -4042,22 +4370,43 @@ def main() -> None:
     if bonos_no_elegibles:
         logger.info("Bonos no elegibles al %s (plazo, spread o emisor): %s",
                     fecha_cierre.date(), sorted(bonos_no_elegibles))
-    motivos_cierre = pipeline.tradability_issues_at(fecha_cierre, multi_returns.index[0], tickers_mercado)
+    # --- Ventanas: la cola del CVaR usa historia larga; retorno y covarianza, la corta ---
+    dias_cvar = int(round(CVAR_VENTANA_ANIOS * TRADING_DAYS))
+    ventana_larga = multi_returns.tail(dias_cvar)
+    if len(ventana_larga) < 0.98 * dias_cvar:
+        raise ValueError(f"Sólo hay {len(ventana_larga)} días de retornos y la ventana del CVaR pide "
+                         f"{dias_cvar}: sube HISTORIA_ANIOS o baja CVAR_VENTANA_ANIOS.")
+    inicio_corta = ventana_larga.index[-min(LOOKBACK_DIAS, len(ventana_larga))]
+    motivos_corta = pipeline.tradability_issues_at(fecha_cierre, inicio_corta, tickers_mercado)
+    motivos_cierre = pipeline.tradability_issues_at(fecha_cierre, ventana_larga.index[0], tickers_mercado)
     if motivos_cierre:
         logger.info("Activos de mercado no invertibles al %s (ventana %s–%s): %s",
-                    fecha_cierre.date(), multi_returns.index[0].date(), fecha_cierre.date(),
+                    fecha_cierre.date(), ventana_larga.index[0].date(), fecha_cierre.date(),
                     "; ".join(f"{tk} ({m})" for tk, m in sorted(motivos_cierre.items())))
+    corta = ventana_larga.tail(LOOKBACK_DIAS)
+    sin_historia_cvar = sorted(
+        (set(motivos_cierre) | set(ventana_larga.columns[ventana_larga.isna().any()]))
+        - set(motivos_corta) - set(corta.columns[corta.isna().any()])
+    )
+    if sin_historia_cvar:
+        alertas.append(
+            f"{len(sin_historia_cvar)} activo(s) cumplen la ventana de estimación pero no la del CVaR "
+            f"({CVAR_VENTANA_ANIOS:g} años: historia insuficiente o poco líquidos) y quedan fuera: "
+            f"{', '.join(sin_historia_cvar)}. Baja CVAR_VENTANA_ANIOS si quieres incluirlos, a costa "
+            "de una cola menos confiable."
+        )
 
     # --- Retornos pro-forma del universo invertible ---
     no_invertibles_cierre = (bonos_no_elegibles | set(motivos_cierre)
-                             | set(multi_returns.columns[multi_returns.isna().any()]))
-    retornos_estrategicos = fi_engine.proforma_log_returns(
+                             | set(ventana_larga.columns[ventana_larga.isna().any()]))
+    retornos_cola = fi_engine.proforma_log_returns(
         fecha_cierre,
-        multi_returns.drop(columns=sorted(no_invertibles_cierre & set(multi_returns.columns))),
+        ventana_larga.drop(columns=sorted(no_invertibles_cierre & set(ventana_larga.columns))),
     )
 
     optimizer = PortfolioOptimizer(
-        retornos_estrategicos,
+        retornos_cola.tail(LOOKBACK_DIAS),
+        tail_returns=retornos_cola,
         rf=rf_tes,
         max_weight=policy.max_weights(specs),
         shrinkage=USAR_SHRINKAGE_LEDOIT_WOLF,
@@ -4075,7 +4424,17 @@ def main() -> None:
     objetivo = _elegir_objetivo(objetivo, rangos)
     logger.info("Criterio de optimización: %s", objetivo.label)
 
-    weights_opt, info_opt = optimizer.optimize(objetivo, rangos)
+    diag = optimizer.tail_diagnostics(objetivo)
+    logger.info("Cola del CVaR: %.1f años (%d observaciones), %.0f en la cola; mínimo recomendado %.1f años.",
+                diag["anios"], diag["observaciones"], diag["obs_en_la_cola"], diag["anios_minimos"])
+    if diag["obs_en_la_cola"] < CVAR_MIN_OBS_COLA:
+        alertas.append(
+            f"El CVaR se apoya en sólo {diag['obs_en_la_cola']:.0f} observaciones en la cola (mínimo "
+            f"recomendado {CVAR_MIN_OBS_COLA}): se necesitan al menos {diag['anios_minimos']:.1f} años con "
+            f"retornos {objetivo.return_freq}s (hay {diag['anios']:.1f}). Trátalo como una estimación aproximada."
+        )
+
+    weights_opt, info_opt = optimizer.solve(objetivo, rangos)
     if info_opt["nota"]:
         logger.warning(info_opt["nota"])
         alertas.append(str(info_opt["nota"]))
@@ -4177,6 +4536,7 @@ def main() -> None:
             exclude_fn=no_invertibles,
             window_fn=fi_engine.proforma_log_returns,
             objective=objetivo,
+            cvar_lookback_days=dias_cvar,
         )
         backtester.run()
         perf_summary = backtester.performance_summary()
@@ -4204,11 +4564,13 @@ def main() -> None:
 
     # --- Medidas clave ---
     capital_txt = f"{CAPITAL_INVERSION_COP / 1e6:,.0f} M COP" if CAPITAL_INVERSION_COP else "—"
+    cvar_lo, cvar_hi = optimizer.cvar_interval(weights_opt.to_numpy(), objetivo)
     report.add_kpis([
         ("Retorno esperado (E.A.)", f"{medidas['retorno_esperado_anual']:.1%}"),
         ("Volatilidad anual", f"{medidas['volatilidad_anual']:.1%}"),
         ("Sharpe esperado", f"{medidas['sharpe']:.2f}"),
-        (f"CVaR {objetivo.cvar_level:.0%} a {objetivo.horizon_days} días", f"{medidas['cvar_horizonte']:.1%}"),
+        (f"CVaR {objetivo.cvar_level:.0%} a {objetivo.horizon_days} días (IC 90%: {cvar_lo:.1%} a {cvar_hi:.1%})",
+         f"{medidas['cvar_horizonte']:.1%}"),
         (f"VaR {objetivo.cvar_level:.0%} a {objetivo.horizon_days} días", f"{medidas['var_horizonte']:.1%}"),
         ("Renta variable / fija", f"{peso_rv:.0f}% / {peso_rf:.0f}%"),
         ("Activos (efectivos)", f"{n_activos} ({medidas['activos_efectivos']:.1f})"),
@@ -4238,16 +4600,23 @@ def main() -> None:
                      _fig_pesos_riesgo(tabla_pesos_visible))
     report.add_chart("Distribución por clase y sub-clase", _fig_distribucion(dist_subclase))
 
+    if "curva_activos" in info_opt and len(info_opt["curva_activos"]) >= 3:
+        report.add_chart(
+            f"Objetivo según el número de activos (elegido: {info_opt['activos_elegidos']})",
+            _fig_curva_activos(info_opt["curva_activos"], int(info_opt["activos_elegidos"]), objetivo),
+        )
+
     # --- Rango alcanzable y frontera ---
-    nota_objetivo = f" {info_opt['nota']}" if info_opt["nota"] else ""
     report.add_table(
         f"Rango alcanzable y portafolios de referencia (CVaR {objetivo.cvar_level:.0%} a "
-        f"{objetivo.horizon_days} días){nota_objetivo}",
+        f"{objetivo.horizon_days} días"
+        + (f"; mínimo {objetivo.min_assets} activos" if objetivo.min_assets else "") + ")",
         _formatear_medidas(tabla_rango),
     )
-    report.add_chart("Frontera eficiente",
-                     optimizer.plot_efficient_frontier(weights_opt, objetivo.label,
-                                                       optimizer.reference_weights_))
+    with optimizer.diversified(objetivo):      # misma restricción de mínimo de activos que el resultado
+        figura_frontera = optimizer.plot_efficient_frontier(weights_opt, objetivo.label,
+                                                            optimizer.reference_weights_)
+    report.add_chart("Frontera eficiente", figura_frontera)
 
     # --- Renta fija ---
     report.add_chart(f"Curva TES al {fecha_cierre.date()}",
@@ -4279,6 +4648,15 @@ def main() -> None:
             f"Activos no invertibles al cierre ({len(tabla_excluidos)})",
             InteractiveReport.table_html(tabla_excluidos, "{:.0f}"),
         )
+    confiabilidad = pd.DataFrame({"valor": {
+        "Años de historia de la cola": f"{diag['anios']:.1f}",
+        "Observaciones (retornos " + objetivo.return_freq + "s)": f"{diag['observaciones']:.0f}",
+        "Observaciones en la cola": f"{diag['obs_en_la_cola']:.0f} (mínimo recomendado {CVAR_MIN_OBS_COLA})",
+        "Escenarios simulados al horizonte": f"{objetivo.n_scenarios}",
+        "CVaR del portafolio": f"{medidas['cvar_horizonte']:.2%}",
+        "Intervalo de confianza 90% del CVaR": f"{cvar_lo:.2%} a {cvar_hi:.2%}",
+    }})
+    report.add_details("Confiabilidad del CVaR", InteractiveReport.table_html(confiabilidad))
     report.add_details(
         "Metodología y límites",
         "<p><b>Datos.</b> Precios de Yahoo Finance y curva cero cupón TES en pesos del Banco de la "
@@ -4287,10 +4665,15 @@ def main() -> None:
         f"<p><b>Estimación.</b> Ventana de {LOOKBACK_DIAS} días; covarianza con shrinkage Ledoit-Wolf; "
         "retorno esperado de acciones y ETFs con Bayes-Stein; el de la renta fija es analítico "
         "(YTM + roll-down).</p>"
-        f"<p><b>CVaR.</b> Simulación histórica con retornos {objetivo.return_freq}s continuos, sumados "
-        f"a {objetivo.horizon_days} días en ventanas móviles"
+        f"<p><b>CVaR.</b> Bootstrap por bloques (~{objetivo.block_days} días) de los retornos "
+        f"{objetivo.return_freq}s continuos de los últimos {CVAR_VENTANA_ANIOS:g} años, encadenados hasta "
+        f"{objetivo.horizon_days} días"
         + (" y recentrados en el retorno esperado" if objetivo.center_on_mu else "")
-        + ". Los escenarios se solapan, así que la cola se apoya en pocos meses independientes.</p>"
+        + f". Se simulan {objetivo.n_scenarios} trayectorias; el intervalo de confianza refleja cuánto "
+        "podría cambiar el CVaR con otra muestra de la historia.</p>"
+        "<p><b>Número de activos.</b> Heurística de eliminación hacia atrás (no garantiza el óptimo "
+        "global): se parte del óptimo libre y se quitan los activos de menor peso, re-optimizando."
+        "</p>"
         "<p><b>Sin topes ni bandas</b> el óptimo tiende a concentrarse; el resultado es muy sensible a "
         "los retornos esperados. Revisa los pesos antes de operar.</p>",
     )

@@ -33,7 +33,7 @@ The script runs from `main()` in eight steps. Everything you can edit sits in th
 - `"validacion"`: the same, plus the walk-forward backtest (step 7) to check how the method would have behaved in the past.
 
 ### 1. Market data and universe selection (`MarketDataPipeline`)
-- Downloads daily adjusted close prices from **Yahoo Finance** (`yfinance`). The window ends at `FECHA_FIN` (`None` = today) and starts `HISTORIA_ANIOS` earlier, unless `FECHA_INICIO` is set.
+- Downloads daily adjusted close prices from **Yahoo Finance** (`yfinance`). The window ends at `FECHA_FIN` (`None` = today) and starts `HISTORIA_ANIOS` (8) earlier, unless `FECHA_INICIO` is set. It must cover the CVaR window; in validation mode what remains is the backtest period (a backtest with CVaR criteria takes several minutes).
 - If a ticker fails to download, it generates a **synthetic series** (geometric Brownian motion with a common market factor plus an idiosyncratic shock). The seed is stable per ticker (CRC32), so runs are reproducible.
 - When calendars are aligned, a missing price is carried forward for **at most 5 days**. A security listed after the start date stays as missing data before its first price, without truncating the matrix.
 - A ticker with only a synthetic series is excluded from the whole run (`EXCLUIR_ACTIVOS_SIN_PRECIO_REAL`).
@@ -97,9 +97,11 @@ For each asset: annualized volatility, annualized geometric return, beta against
 - `min_cvar`: lowest CVaR. A linear program (Rockafellar-Uryasev) over historical scenarios.
 - `max_retorno_cvar`: highest expected return with CVaR at most `CVAR_OBJETIVO_MENSUAL`. Same linear program.
 
-**CVaR scenarios.** Continuous daily (or weekly, `FRECUENCIA_RETORNOS_CVAR`) log returns of the estimation window are summed in rolling windows that cover the horizon (`HORIZONTE_DIAS`, 21 = one month) and, by default, re-centred on the expected return the optimizer uses (`CVAR_CENTRAR_EN_MU`), so the tail does not inherit past trends. The level is `CVAR_NIVEL` (95%). The scenarios overlap, so with a 2-year window there are only about 24 independent months: read the CVaR as an approximation.
+**CVaR scenarios and reliability.** The tail needs far more data than the mean and covariance, so it has its own, longer window (`CVAR_VENTANA_ANIOS`, 5 years; mean and covariance use `LOOKBACK_DIAS`, 2 years). Monthly scenarios (`HORIZONTE_DIAS`, 21 = one month) are simulated with a **stationary block bootstrap** of the continuous daily (or weekly) log returns of that window, re-centred on the expected return the optimizer uses (`CVAR_CENTRAR_EN_MU`): blocks of real days keep correlations and volatility clusters, and the CVaR rests on about 1,260 daily observations instead of about 60 overlapping months. The level is `CVAR_NIVEL` (95%) and `CVAR_ESCENARIOS` paths are simulated. The program checks that at least `CVAR_MIN_OBS_COLA` observations (30) fall in the tail (about 2.4 years of daily data, more than 11 years of weekly data), and the report shows a 90% confidence interval of the portfolio's CVaR, obtained by resampling the history: a wide interval means the history does not pin the tail down. Assets without the full CVaR window are left out and listed in the alerts.
 
-**Reachable range and interactive choice.** Before optimizing, the program shows a table of reference portfolios (minimum variance, minimum CVaR, maximum Sharpe, maximum return) with their measures; the minimum and the maximum-return rows delimit the reachable volatility and CVaR. In an interactive terminal it then asks for the criterion and the target (Enter keeps what is configured; `PREGUNTAR_ANTES_DE_OPTIMIZAR = False` disables the questions). A target left empty takes the middle of the range, and one outside the range is replaced by the closest feasible value, with a warning.
+**Number of assets** (section 9 of the configuration). `MAX_ACTIVOS` (12) caps the number of assets and `PESO_MIN_POSICION` (3%) sets the smallest position; both are solved with a heuristic (solve the free optimum, then remove the smallest-weight assets one by one and re-optimize), which gives good but not provably optimal solutions because the problem is combinatorial. `MIN_ACTIVOS` (5) forces at least that many assets by capping each at 1/N (20%). With `CARDINALIDAD_AUTOMATICA` the program picks, between the minimum and the maximum, the portfolio with the fewest assets whose objective is within `CARDINALIDAD_TOLERANCIA` (2%) of the best, and the report plots the objective against the number of assets. In-sample, more assets never hurt the objective, so an "optimal number" only makes sense with a tolerance like this one.
+
+**Reachable range and interactive choice.** Before optimizing, the program shows a table of reference portfolios (computed with the minimum-assets cap) (minimum variance, minimum CVaR, maximum Sharpe, maximum return) with their measures; the minimum and the maximum-return rows delimit the reachable volatility and CVaR. In an interactive terminal it then asks for the criterion and the target (Enter keeps what is configured; `PREGUNTAR_ANTES_DE_OPTIMIZAR = False` disables the questions). A target left empty takes the middle of the range, and one outside the range is replaced by the closest feasible value, with a warning.
 Long-only and fully invested, for the criterion chosen in section 8 of the configuration (`CRITERIO_OPTIMIZACION`). **By default there are no other restrictions:** the optimizer picks the assets that best serve the criterion, and the RV/RF split comes out of the result (the report shows it by class and sub-class, with amounts in COP if `CAPITAL_INVERSION_COP` is set). Without caps the optimum tends to concentrate in few assets, so the report also shows the number of assets and the effective number (1/HHI), and raises an alert when it is very concentrated. Optional constraints, off by default (section 9 of the configuration):
 - **strategic bands per asset class** (`BANDAS_POR_CLASE`), e.g. RV 40%–60% and RF 40%–60%;
 - **a general weight cap per asset** (`MAX_PESO_POR_ACTIVO`) and **caps per instrument type** (`TOPES_POR_TIPO`: stock, equity ETF, TES node, bond ETF, individual bond).
@@ -124,10 +126,10 @@ A short page, with the central information first:
 - **Alerts** (stale data, demo mode, concentration, a target outside the reachable range, `FECHA_FIN` in the past).
 - **Measure cards:** expected return, volatility, Sharpe, CVaR and VaR at the horizon, RV/RF split, number of assets and the effective number, risk-free rate and capital.
 - **The recommended portfolio:** table with weights, contribution to risk and amounts in COP; a bar chart of weight against risk contribution; and a ring chart by class and sub-class.
-- **Reachable range** table and the **efficient frontier**.
+- **Objective against number of assets** (when it varies), the **reachable range** table and the **efficient frontier**.
 - **Fixed income:** the TES curve at the closing date and, if you entered bonds, their screening table.
 - **Validation mode only:** the equity curve, the RV/RF allocation over time and the out-of-sample performance.
-- **Collapsed:** assets that are not investable at the close, and methodology and limits.
+- **Collapsed:** assets that are not investable at the close, CVaR reliability (years of history, tail observations, confidence interval), and methodology and limits.
 
 ---
 
@@ -157,9 +159,9 @@ All settings live in the **CONFIGURACIÓN (set up)** block at the top of the scr
 5. fixed-income ETFs and TES nodes;
 6. **individual bonds (`BONOS_UNIVERSO`)**, with a guide on which bonds to look for, the fields of each bond and the screening criteria;
 7. TES curve source, cache path and risk-free tenor;
-8. **optimization criterion and targets** (Sharpe, variance, CVaR), CVaR level, horizon and return frequency, and whether to ask before optimizing;
-9. portfolio constraints (free by default: optional bands and weight caps);
-10. lookback (2 years), Ledoit-Wolf and the expected-return estimator;
+8. **optimization criterion and targets** (Sharpe, variance, CVaR); CVaR level, horizon, history window, scenarios and return frequency; and whether to ask before optimizing;
+9. portfolio constraints: optional bands and weight caps, and **minimum / maximum number of assets** and minimum position;
+10. estimation window for return and covariance (2 years), Ledoit-Wolf and the expected-return estimator;
 11. backtest frequency and frontier size;
 12. liquidity and coverage thresholds;
 13. simulation parameters and random seed;
