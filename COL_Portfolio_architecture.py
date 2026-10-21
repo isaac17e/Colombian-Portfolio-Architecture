@@ -9,7 +9,6 @@ import logging
 import os
 import ssl
 import sys
-import warnings
 import zlib
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -36,7 +35,6 @@ except ImportError:
     _YFINANCE_AVAILABLE = False
 
 # --- Avisos y tema gráfico ----------------------------------------------------
-warnings.filterwarnings("ignore", category=FutureWarning)
 pio.templates.default = "plotly_white"
 
 # --- Logging ------------------------------------------------------------------
@@ -159,7 +157,6 @@ ACCIONES_BVC: List[str] = [
     "CONCONCRET.CL",
     "CNEC.CL",
     "BHI.CL",
-    "NUAMCO.CL",
 ]
 ETFS_RV_LOCALES: List[str] = ["ICOLCAP.CL", "HCOLSEL.CL"]
 ETFS_RV_GLOBALES: List[str] = ["SPY", "QQQ"]
@@ -2376,7 +2373,7 @@ class RiskMetrics:
     @staticmethod
     def beta(asset_returns: pd.Series, market_returns: pd.Series) -> float:
         """Beta sectorial/de mercado: Cov(asset, market) / Var(market)."""
-        aligned = pd.concat([asset_returns, market_returns], axis=1).dropna()
+        aligned = pd.concat([asset_returns, market_returns], axis=1, sort=True).dropna()
         if aligned.shape[0] < 2:
             return float("nan")
         return float(aligned.cov().iloc[0, 1] / aligned.iloc[:, 1].var())
@@ -2621,6 +2618,7 @@ class PortfolioOptimizer:
         self.mu_ = mu_series.values
         self.mu_series_ = pd.Series(self.mu_, index=self.assets, name="mu")
         self.result_: Optional[optimize.OptimizeResult] = None
+        self.min_variance_fallback_: bool = False
 
     # ------------------------------------------------------------------ #
     # ESTIMADOR DE μ (BAYES-STEIN)
@@ -2805,8 +2803,9 @@ class PortfolioOptimizer:
         # --- QP convexo en u: topes, mínimos y bandas escalados por Σu ---
         best_w: Optional[np.ndarray] = None
         if max_excess <= 1e-12:
-            logger.warning("Max Sharpe: ningún portafolio factible supera la tasa libre de riesgo; "
-                           "se usa el de mínima varianza.")
+            logger.debug("Max Sharpe: ningún portafolio factible supera la tasa libre de riesgo; "
+                         "se usa el de mínima varianza.")
+            self.min_variance_fallback_ = True
             best_w = self._min_variance_weights()
         else:
             ones, eye = np.ones((1, self.n)), np.eye(self.n)
@@ -3478,6 +3477,7 @@ class WalkForwardBacktester:
         self.rf_used_: Optional[pd.Series] = None
         self.excluded_history_: Dict[pd.Timestamp, Set[str]] = {}
         self.mu_shrinkage_history_: Dict[pd.Timestamp, Dict[str, float]] = {}
+        self.min_variance_dates_: List[pd.Timestamp] = []
 
     # ------------------------------------------------------------------ #
     # PREPARACIÓN DE CADA REBALANCEO
@@ -3531,6 +3531,8 @@ class WalkForwardBacktester:
         opt = self._build_optimizer(window_returns, reb_date)
         self.mu_shrinkage_history_[reb_date] = dict(opt.mu_shrinkage_)
         weights, _ = opt.solve(self.objective)
+        if self.objective.criterion == "max_sharpe" and opt.min_variance_fallback_:
+            self.min_variance_dates_.append(reb_date)
         return weights, opt.rf
 
     # ------------------------------------------------------------------ #
@@ -3564,6 +3566,7 @@ class WalkForwardBacktester:
 
         self.excluded_history_ = {}
         self.mu_shrinkage_history_ = {}
+        self.min_variance_dates_ = []
 
         # --- Bucle walk-forward ---
         for i, reb_date in enumerate(rebal_dates):
@@ -3593,6 +3596,13 @@ class WalkForwardBacktester:
         self.portfolio_returns_ = pd.concat(daily_portfolio_returns).sort_index()
         self.equity_curve_ = np.exp(self.portfolio_returns_.cumsum())
         self._aggregate_exposures()
+        if self.min_variance_dates_:
+            logger.warning(
+                "Max Sharpe: en %d de %d rebalanceos ningún portafolio factible superó la tasa libre "
+                "de riesgo y se usó el de mínima varianza (%s a %s).",
+                len(self.min_variance_dates_), len(rebal_dates),
+                self.min_variance_dates_[0].date(), self.min_variance_dates_[-1].date(),
+            )
         return self.weights_history_
 
     # ------------------------------------------------------------------ #
@@ -4497,6 +4507,11 @@ def main() -> None:
         )
 
     weights_opt, info_opt = optimizer.solve(objetivo, rangos)
+    if objetivo.criterion == "max_sharpe" and optimizer.min_variance_fallback_:
+        aviso = ("Máximo Sharpe: ningún portafolio factible supera la tasa libre de riesgo; el "
+                 "portafolio óptimo es el de mínima varianza.")
+        logger.warning(aviso)
+        alertas.append(aviso)
     if info_opt["nota"]:
         logger.warning(info_opt["nota"])
         alertas.append(str(info_opt["nota"]))
@@ -4602,6 +4617,13 @@ def main() -> None:
         )
         backtester.run()
         perf_summary = backtester.performance_summary()
+        if backtester.min_variance_dates_:
+            alertas.append(
+                f"Mínima varianza en lugar de máximo Sharpe: en {len(backtester.min_variance_dates_)} de "
+                f"{len(backtester.weights_history_)} rebalanceos ningún portafolio factible superó la tasa libre "
+                f"de riesgo (entre {backtester.min_variance_dates_[0].date()} y "
+                f"{backtester.min_variance_dates_[-1].date()}); ahí el backtest no refleja máximo Sharpe."
+            )
 
         # --- Salida en consola del backtest ---
         print("\n--- Asignación por clase de activo en cada rebalanceo (%) ---")
