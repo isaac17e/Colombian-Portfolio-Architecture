@@ -50,14 +50,82 @@ TRADING_DAYS: int = 252
 
 
 # ==============================================================================
-#                        ⚙  PARÁMETROS EDITABLES DEL MOTOR
+#                  ⚙  CONFIGURACIÓN (SET UP) — TODO LO EDITABLE VIVE AQUÍ
 # ------------------------------------------------------------------------------
+# Todo lo que se puede ajustar está en este bloque; el resto del archivo es el
+# motor y no necesita tocarse. Las secciones van en el orden en que se usan:
+#
+#   1. Modo de ejecución y capital
+#   2. Ventana de análisis (fechas)
+#   3. Política de datos reales y alertas de calidad
+#   4. Universo de Renta Variable
+#   5. Universo de Renta Fija: ETFs y nodos TES
+#   6. Universo de Renta Fija: BONOS INDIVIDUALES (los llenas tú)
+#   7. Curva TES (tasa libre de riesgo y base de la renta fija)
+#   8. Restricciones del portafolio (libre por defecto)
+#   9. Estimación de retornos y riesgo
+#  10. Backtest (sólo modo "validacion")
+#  11. Liquidez y cobertura de precios
+#  12. Parámetros del modelo de simulación
+#  13. Salida
+# ==============================================================================
 
-# --- Ventana de análisis ------------------------------------------------------
-FECHA_INICIO: str = "2021-01-01"
-FECHA_FIN: str = "2024-12-31"
+# ------------------------------------------------------------------------------
+# 1. MODO DE EJECUCIÓN Y CAPITAL
+# ------------------------------------------------------------------------------
+# "recomendacion": calcula el portafolio óptimo con los datos más recientes y
+#                  lo muestra con montos en pesos. Es el modo para invertir hoy.
+# "validacion":    además de lo anterior, corre el backtest walk-forward para
+#                  comprobar cómo se habría comportado el método en el pasado.
+MODO_EJECUCION: str = "recomendacion"
 
-# --- Universo de Renta Variable ----------------------------------------------
+# Capital a invertir (COP) para convertir los pesos del portafolio en montos.
+# None = sólo muestra porcentajes.
+CAPITAL_INVERSION_COP: Optional[float] = 100_000_000.0
+
+# ------------------------------------------------------------------------------
+# 2. VENTANA DE ANÁLISIS
+# ------------------------------------------------------------------------------
+# Fecha del último dato. None = hoy. Para reproducir un resultado pasado, fija
+# una fecha ("2024-12-31"): las tasas de tus bonos (sección 6) deben ser las de
+# ESA fecha.
+FECHA_FIN: Optional[str] = None
+
+# Años de historia hacia atrás. Sólo se usa si FECHA_INICIO es None.
+HISTORIA_ANIOS: float = 4.0
+
+# Fecha de inicio fija ("2021-01-01"). None = FECHA_FIN menos HISTORIA_ANIOS.
+FECHA_INICIO: Optional[str] = None
+
+# ------------------------------------------------------------------------------
+# 3. POLÍTICA DE DATOS REALES Y ALERTAS DE CALIDAD
+# ------------------------------------------------------------------------------
+# False (recomendado para invertir): si no hay precios reales de suficientes
+#   acciones, o no se logra descargar la curva TES del Banco de la República, el
+#   programa se DETIENE con un mensaje claro en vez de optimizar con datos
+#   inventados.
+# True: permite el "modo demostración" con series simuladas (sólo para probar el
+#   código sin internet; los resultados NO sirven para invertir).
+PERMITIR_DATOS_SINTETICOS: bool = False
+
+# Días calendario máximos entre FECHA_FIN y el último dato disponible (precio
+# de mercado o curva TES). Si se supera, el programa avisa; con datos reales y
+# PERMITIR_DATOS_SINTETICOS = False, una curva TES más vieja que esto detiene la
+# corrida. Cubre fines de semana, festivos y el rezago de publicación de Banrep.
+MAX_DIAS_DATOS_DESACTUALIZADOS: int = 7
+
+# Un ticker sin precio real se excluye de toda la corrida.
+EXCLUIR_ACTIVOS_SIN_PRECIO_REAL: bool = True
+
+# Mínimo de acciones/ETFs de RV con precio real para considerar los datos válidos.
+MIN_ACTIVOS_RV_REALES: int = 5
+
+# ------------------------------------------------------------------------------
+# 4. UNIVERSO DE RENTA VARIABLE
+# ------------------------------------------------------------------------------
+# Tickers de Yahoo Finance. Agrega o quita los que quieras; los que no tengan
+# precio real, historia suficiente o liquidez se descartan solos y el reporte
+# explica por qué.
 ACCIONES_BVC: List[str] = [
     "ECOPETROL.CL",
     "TERPEL.CL",
@@ -91,80 +159,199 @@ ACCIONES_BVC: List[str] = [
 ETFS_RV_LOCALES: List[str] = ["ICOLCAP.CL", "HCOLSEL.CL"]
 ETFS_RV_GLOBALES: List[str] = ["SPY", "QQQ"]
 
-# --- Universo de Renta Fija ---------------------------------------------------
+# Índice de referencia para calcular betas (no se invierte en él).
+BENCHMARK: str = "^GSPC"
+
+# ------------------------------------------------------------------------------
+# 5. UNIVERSO DE RENTA FIJA: ETFs Y NODOS TES
+# ------------------------------------------------------------------------------
+# ETFs / fondos de renta fija con precio de mercado en Yahoo Finance.
 ETFS_RF_LOCALES: List[str] = []
 ETFS_RF_GLOBALES: List[str] = ["TLT"]
 
+# Nodos sintéticos de la curva TES: bonos "par" de plazo constante (en años) que
+# representan comprar TES a ese plazo. Son replicables con TES reales.
 NODOS_TES: List[float] = [1.0, 3.0, 5.0, 10.0]
 
-BENCHMARK: str = "^GSPC"
-
-# --- Curva cero cupón de TES (ETTI) ------------------------------------------
-CURVA_TES_PLAZOS: List[float] = [0.083, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20]
-CURVA_TES_TASAS: List[float] = [
-    0.0980, 0.0975, 0.0965, 0.0950, 0.0940, 0.0935, 0.0955, 0.0975, 0.0995, 0.1010, 0.1015
+# ------------------------------------------------------------------------------
+# 6. UNIVERSO DE RENTA FIJA: BONOS INDIVIDUALES  (TÚ LOS LLENAS)
+# ------------------------------------------------------------------------------
+# Lista vacía = el portafolio se arma sólo con acciones, ETFs y nodos TES.
+#
+# GUÍA PARA ESCOGER QUÉ BONOS INGRESAR
+# Un bono entra al optimizador sólo si cumple los criterios de más abajo. Para no
+# perder tiempo, busca bonos que cumplan TODO esto:
+#   # Tasa fija en pesos (indexación "TF"). La curva TES del motor es nominal en
+#     pesos: un bono en UVR/IPC/IBR no es comparable con ella.
+#   # Calificación local AAA o AA+ (BONOS_MIN_RATING). Un TES se ingresa como "AAA".
+#   # Plazo residual entre 1 y 10 años desde FECHA_FIN (BONOS_PLAZO_*).
+#   # Que tenga una tasa (YTM) o un precio de mercado reciente: Precia, PiP, BVC o
+#     tu comisionista. Debe ser la del día FECHA_FIN.
+#   # Que se pueda comprar de verdad: emisión grande y que cotice seguido
+#     (puntaje de liquidez >= BONOS_MIN_LIQUIDEZ).
+#   # Spread sobre la curva TES de hasta 450 pb (BONOS_MAX_SPREAD_BP): spreads más
+#     altos indican riesgo de crédito que el calificador no está viendo.
+#   # Máximo 2 bonos del mismo emisor (BONOS_MAX_POR_EMISOR) para diversificar.
+#
+# CAMPOS DE CADA BONO (uno por diccionario)
+#   "isin"        OBLIGATORIO. Identificador único del título. En Colombia se usa el
+#                 ISIN (p. ej. "COL17CT02622"); si tienes el CUSIP, también sirve:
+#                 sólo se usa para identificar y no puede repetirse.
+#   "emisor"      OBLIGATORIO. Nombre del emisor ("Bancolombia", "ISA", ...). Se usa
+#                 para limitar cuántos bonos del mismo emisor entran.
+#   "rating"      OBLIGATORIO. Calificación local: "AAA", "AA+", "AA", "AA-", "A+", ...
+#   "cupon"       OBLIGATORIO. Tasa cupón efectiva anual en decimal (7,25% = 0.0725).
+#   "vencimiento" OBLIGATORIO. Fecha de vencimiento, formato "AAAA-MM-DD".
+#   --- Precio de mercado: pon UNO de estos tres (se usa el primero que aparezca) ---
+#   "ytm"         Tasa de mercado (YTM) efectiva anual en decimal (10,5% = 0.105).
+#                 Es la mejor opción: es lo que publican los proveedores de precios.
+#   "precio"      Precio SUCIO (con cupón corrido) por cada 100 de valor nominal.
+#   "spread_bp"   Spread en puntos básicos sobre la curva TES al mismo plazo.
+#   --- Opcionales ---
+#   "frecuencia"  Pagos de cupón por año: 1 (anual), 2 (semestral), 4 (trimestral).
+#                 Por defecto 1.
+#   "indexacion"  "TF" (tasa fija), "UVR", "IPC", "IBR". Por defecto "TF".
+#   "liquidez"    Puntaje 0 a 1 que asignas tú. Referencia: 0.8-1.0 TES de referencia
+#                 o emisión muy grande que cotiza a diario; 0.5-0.7 corporativo AAA
+#                 que cotiza varias veces por semana; 0.3-0.5 cotiza poco; < 0.3
+#                 casi no se negocia. Por defecto 0.5.
+#   "sector"      Texto libre ("Soberano", "Financiero", "Utilities", ...). Sólo informativo.
+#
+# EJEMPLO (descomenta y reemplaza por datos reales; este ISIN y estas tasas son
+# inventados):
+BONOS_UNIVERSO: List[Dict[str, object]] = [
+    # {
+    #     "isin": "COL17CT02622",
+    #     "emisor": "Ministerio de Hacienda (TES)",
+    #     "rating": "AAA",
+    #     "cupon": 0.0700,
+    #     "vencimiento": "2031-06-30",
+    #     "ytm": 0.1050,
+    #     "frecuencia": 1,
+    #     "indexacion": "TF",
+    #     "liquidez": 0.90,
+    #     "sector": "Soberano",
+    # },
 ]
-RUTA_CURVA_TES_CSV: Optional[str] = None
 
+# --- Criterios de selección (filtro de política) ------------------------------
+# Un bono que no los cumpla queda fuera del optimizador y el reporte dice por qué.
+# Los de plazo, spread y emisor se vuelven a evaluar en cada fecha de decisión.
+BONOS_MIN_RATING: str = "AA+"          # Calificación mínima. AA o inferior se rechaza.
+BONOS_PLAZO_MIN_ANIOS: float = 1.0     # Plazo residual mínimo; antes de esto el bono "sale" para no llegar al vencimiento.
+BONOS_PLAZO_MAX_ANIOS: float = 10.0    # Plazo residual máximo; los bonos más largos tienen mucha duración (riesgo de tasa).
+BONOS_MIN_LIQUIDEZ: float = 0.35       # Puntaje de liquidez mínimo (campo "liquidez" de cada bono).
+BONOS_MAX_SPREAD_BP: Optional[float] = 450.0  # Spread máximo sobre la curva TES, en pb. None = sin límite.
+BONOS_MAX_POR_EMISOR: int = 2          # Máximo de bonos por emisor (si hay más, se queda el de mayor YTM ajustada por liquidez). 0 = sin límite.
+BONOS_INDEXACIONES_PERMITIDAS: Optional[Set[str]] = {"TF"}  # Indexaciones aceptadas. None = todas (no recomendado).
+BONOS_EMISORES_EXCLUIDOS: Set[str] = set()  # Emisores prohibidos por política, p. ej. {"Avianca"}.
+
+# Volatilidad diaria (pb) del spread de crédito, que se simula porque no hay
+# precios históricos por bono; se escala por iliquidez (menos líquido = más
+# volátil). Sube el valor si quieres suponer bonos corporativos más riesgosos.
+BONOS_VOL_SPREAD_BP_DIARIA: float = 2.0
+
+# ------------------------------------------------------------------------------
+# 7. CURVA TES (TASA LIBRE DE RIESGO Y BASE DE LA RENTA FIJA)
+# ------------------------------------------------------------------------------
+# "banrep":   histórico real de tasas cero cupón TES a 1, 5 y 10 años del Banco de
+#             la República, completado a los demás plazos con Nelson-Siegel.
+# "simulada": curva fija de abajo con choques simulados (sólo para pruebas).
 CURVA_TES_FUENTE: str = "banrep"
 CURVA_TES_TAU_NS: float = 1.37
 RUTA_CACHE_CURVA_TES: str = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "datos", "tes_cero_cupon_banrep.csv"
 )
 
+# Plazo del TES que se toma como tasa libre de riesgo (años).
 RF_TENOR_YEARS: float = 1.0
 
-# --- Bandas estratégicas por clase de activo ---------------------------------
-BANDA_RV: Tuple[float, float] = (0.40, 0.60)
-BANDA_RF: Tuple[float, float] = (0.40, 0.60)
+# Curva fija para el modo "simulada" (o CSV de Banrep con columnas plazo_anios, tasa).
+CURVA_TES_PLAZOS: List[float] = [0.083, 0.25, 0.5, 1, 2, 3, 5, 7, 10, 15, 20]
+CURVA_TES_TASAS: List[float] = [
+    0.0980, 0.0975, 0.0965, 0.0950, 0.0940, 0.0935, 0.0955, 0.0975, 0.0995, 0.1010, 0.1015
+]
+RUTA_CURVA_TES_CSV: Optional[str] = None
 
-# --- Topes de concentración por tipo de instrumento --------------------------
-MAX_PESO_ACCION_INDIVIDUAL: float = 0.15
-MAX_PESO_ETF_RV: float = 0.20
-MAX_PESO_ETF_RF: float = 0.20
-MAX_PESO_NODO_TES: float = 0.20
-MAX_PESO_BONO_INDIVIDUAL: float = 0.15
+# Incluir el roll-down (ganancia por "rodar" hacia plazos más cortos de la curva)
+# en el retorno esperado de los nodos TES y de los bonos.
+INCLUIR_ROLLDOWN: bool = True
 
-# --- Screening de bonos individuales (Enfoque C) ------------------------------
-BONOS_MIN_RATING: str = "AA+"
-BONOS_PLAZO_MIN_ANIOS: float = 1.0
-BONOS_PLAZO_MAX_ANIOS: float = 10.0
-BONOS_MIN_LIQUIDEZ: float = 0.35
-BONOS_MAX_SPREAD_BP: Optional[float] = 450.0
-BONOS_MAX_POR_EMISOR: int = 2
-BONOS_INDEXACIONES_PERMITIDAS: Optional[Set[str]] = {"TF"}
-BONOS_EMISORES_EXCLUIDOS: Set[str] = set()
+# ------------------------------------------------------------------------------
+# 8. RESTRICCIONES DEL PORTAFOLIO (LIBRE POR DEFECTO)
+# ------------------------------------------------------------------------------
+# Por defecto el optimizador decide libremente, sin ventas en corto y 100%
+# invertido: escoge los activos que mejor sirvan al criterio de optimización y la
+# proporción RV/RF sale del resultado (se muestra en el reporte). Sin topes el
+# óptimo suele concentrarse en pocos activos; si quieres forzar diversificación,
+# activa alguno de estos límites.
 
-# --- Backtest walk-forward ----------------------------------------------------
-LOOKBACK_DIAS: int = 252
-FRECUENCIA_REBALANCEO: str = "ME"
-USAR_SHRINKAGE_LEDOIT_WOLF: bool = True
-ESTIMADOR_MU: str = "bayes_stein"
+# Banda de peso total por clase de activo: (mínimo, máximo) en decimal, p. ej.
+# {"RV": (0.40, 0.60), "RF": (0.40, 0.60)}. {} = sin bandas.
+BANDAS_POR_CLASE: Dict[str, Tuple[float, float]] = {}
 
-# --- Política de datos --------------------------------------------------------
-EXCLUIR_ACTIVOS_SIN_PRECIO_REAL: bool = True
-MIN_ACTIVOS_RV_REALES: int = 5
+# Tope de peso por activo individual, en decimal (0.15 = 15%). None = sin tope.
+MAX_PESO_POR_ACTIVO: Optional[float] = None
+
+# Tope por tipo de instrumento (tiene prioridad sobre MAX_PESO_POR_ACTIVO).
+# Claves: "accion", "etf_rv", "nodo_tes", "etf_rf", "bono". None = usa el tope general.
+TOPES_POR_TIPO: Dict[str, Optional[float]] = {
+    "accion": None,
+    "etf_rv": None,
+    "nodo_tes": None,
+    "etf_rf": None,
+    "bono": None,
+}
+
+# Peso mínimo (%) para que un activo aparezca en las tablas de resultados.
+PESO_MIN_REPORTE_PCT: float = 0.01
+
+# ------------------------------------------------------------------------------
+# 9. ESTIMACIÓN DE RETORNOS Y RIESGO
+# ------------------------------------------------------------------------------
+LOOKBACK_DIAS: int = 252              # Días hábiles de historia para estimar (252 ≈ 1 año).
+USAR_SHRINKAGE_LEDOIT_WOLF: bool = True  # Suaviza la matriz de covarianza (recomendado).
+ESTIMADOR_MU: str = "bayes_stein"     # Retorno esperado de acciones/ETFs: "bayes_stein" o "muestral".
+
+# ------------------------------------------------------------------------------
+# 10. BACKTEST (sólo en modo "validacion")
+# ------------------------------------------------------------------------------
+FRECUENCIA_REBALANCEO: str = "ME"     # "ME" = último día hábil de cada mes.
+N_PORTAFOLIOS_FRONTERA: int = 3000    # Portafolios aleatorios de la gráfica de frontera eficiente.
+
+# ------------------------------------------------------------------------------
+# 11. LIQUIDEZ Y COBERTURA DE PRECIOS
+# ------------------------------------------------------------------------------
+MAX_PCT_DIAS_SIN_MOVIMIENTO: float = 0.25   # Un activo con más de este % de días sin variación de precio es ilíquido.
+MAX_DIAS_PRECIO_CONGELADO: int = 30         # ...o con el precio igual más de estos días seguidos.
+MAX_DIAS_RELLENO_PRECIO: int = 5            # Días máximos que se arrastra el último precio (festivos).
+HOLGURA_COBERTURA_DIAS: int = 45            # Tolerancia para considerar que un activo "listó tarde".
+
+# ------------------------------------------------------------------------------
+# 12. PARÁMETROS DEL MODELO DE SIMULACIÓN
+# ------------------------------------------------------------------------------
 SEMILLA_ALEATORIA: int = 42
 
-# --- Liquidez y cobertura de precios -----------------------------------------
-MAX_PCT_DIAS_SIN_MOVIMIENTO: float = 0.25
-MAX_DIAS_PRECIO_CONGELADO: int = 30
-MAX_DIAS_RELLENO_PRECIO: int = 5
-HOLGURA_COBERTURA_DIAS: int = 45
-
-# --- Volatilidad de la curva (modelo de 3 factores, puntos básicos diarios) ---
+# Curva TES simulada (3 factores: nivel, pendiente, curvatura; pb diarios). Sólo
+# se usa con CURVA_TES_FUENTE = "simulada" o PERMITIR_DATOS_SINTETICOS = True.
 CURVA_VOL_NIVEL_BP: float = 5.5
 CURVA_VOL_PENDIENTE_BP: float = 3.5
 CURVA_VOL_CURVATURA_BP: float = 2.5
 CURVA_BETA_RV_BP: float = -1.2
+CURVA_SIM_TAU: float = 2.5
+CURVA_SIM_REVERSION: float = 0.015
+CURVA_SIM_PISO: float = 0.005
 
-# --- Salida -------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# 13. SALIDA
+# ------------------------------------------------------------------------------
 DIRECTORIO_SALIDA: str = os.environ.get(
     "OUTPUT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
 )
+NOMBRE_REPORTE_HTML: str = "reporte_interactivo.html"
 
 # ==============================================================================
-#                     FIN DE LOS PARÁMETROS EDITABLES
+#                          FIN DE LA CONFIGURACIÓN
 # ==============================================================================
 
 
@@ -228,7 +415,7 @@ class AssetSpec:
 class AssetUniverse:
     """
     Define el universo invertible. Los valores por defecto se leen del bloque
-    de PARÁMETROS EDITABLES en la cabecera del archivo; se pueden sobrescribir
+    de la CONFIGURACIÓN (set up) en la cabecera del archivo; se pueden sobrescribir
     al instanciar (p. ej. `AssetUniverse(acciones_bvc=[...])`).
     """
 
@@ -328,7 +515,7 @@ class MarketDataPipeline:
                     raw = yf.download(
                         tk,
                         start=self.start,
-                        end=self.end,
+                        end=self.end + pd.Timedelta(days=1),  # yfinance trata `end` como exclusivo
                         auto_adjust=True,
                         progress=False,
                         threads=False,
@@ -597,7 +784,7 @@ class TESYieldCurve:
     @classmethod
     def from_config(cls) -> "TESYieldCurve":
         """
-        Curva construida desde el bloque de PARÁMETROS EDITABLES: usa el CSV de
+        Curva construida desde la CONFIGURACIÓN de la cabecera: usa el CSV de
         Banrep si `RUTA_CURVA_TES_CSV` está definido, y en su defecto los nodos
         de `CURVA_TES_PLAZOS` / `CURVA_TES_TASAS`.
         """
@@ -965,10 +1152,10 @@ class CurveShockConfig:
     level_vol_bp: float = field(default_factory=lambda: CURVA_VOL_NIVEL_BP)
     slope_vol_bp: float = field(default_factory=lambda: CURVA_VOL_PENDIENTE_BP)
     curvature_vol_bp: float = field(default_factory=lambda: CURVA_VOL_CURVATURA_BP)
-    tau: float = 2.5
-    mean_reversion: float = 0.015
+    tau: float = field(default_factory=lambda: CURVA_SIM_TAU)
+    mean_reversion: float = field(default_factory=lambda: CURVA_SIM_REVERSION)
     equity_beta_bp: float = field(default_factory=lambda: CURVA_BETA_RV_BP)
-    floor_rate: float = 0.005
+    floor_rate: float = field(default_factory=lambda: CURVA_SIM_PISO)
     seed: int = field(default_factory=lambda: SEMILLA_ALEATORIA)
 
 
@@ -1292,6 +1479,80 @@ class BondSpec:
     liquidez: float = 0.5
     sector: str = "Corporativo"
 
+    @classmethod
+    def from_config(
+        cls, entry: Mapping[str, object], as_of: Union[str, datetime]
+    ) -> "BondSpec":
+        """
+        Construye un bono desde un diccionario de `BONOS_UNIVERSO` (campos en
+        español, ver la sección 6 de la configuración) y valida lo que el
+        usuario escribe a mano para fallar con un mensaje claro y no más
+        adelante con un error críptico.
+        """
+        required = ("isin", "emisor", "rating", "cupon", "vencimiento")
+        missing = [k for k in required if entry.get(k) in (None, "")]
+        label = entry.get("isin") or entry.get("emisor") or "?"
+        if missing:
+            raise ValueError(f"Bono '{label}' en BONOS_UNIVERSO: faltan los campos {missing}.")
+        quotes = [k for k in ("ytm", "precio", "spread_bp") if entry.get(k) is not None]
+        if not quotes:
+            raise ValueError(
+                f"Bono '{label}' en BONOS_UNIVERSO: falta el precio de mercado; "
+                "ingresa 'ytm', 'precio' o 'spread_bp'."
+            )
+
+        rating = str(entry["rating"]).upper().strip()
+        if rating not in RATING_SCALE:
+            raise ValueError(
+                f"Bono '{label}': rating '{entry['rating']}' desconocido; "
+                f"usa uno de {list(RATING_SCALE)}."
+            )
+        maturity = pd.Timestamp(entry["vencimiento"])
+        if maturity <= pd.Timestamp(as_of):
+            raise ValueError(
+                f"Bono '{label}': vence el {maturity.date()}, que no es posterior a la fecha de "
+                f"los datos ({pd.Timestamp(as_of).date()})."
+            )
+        coupon = float(entry["cupon"])
+        if not 0.0 <= coupon < 1.0:
+            raise ValueError(
+                f"Bono '{label}': 'cupon' debe ir en decimal (7,25% = 0.0725), no {coupon}."
+            )
+        if entry.get("ytm") is not None and not -0.05 < float(entry["ytm"]) < 1.0:
+            raise ValueError(f"Bono '{label}': 'ytm' debe ir en decimal (10,5% = 0.105).")
+        freq = int(entry.get("frecuencia", 1))
+        if freq not in (1, 2, 4, 12):
+            raise ValueError(f"Bono '{label}': 'frecuencia' debe ser 1, 2, 4 o 12, no {freq}.")
+        liquidez = float(entry.get("liquidez", 0.5))
+        if not 0.0 <= liquidez <= 1.0:
+            raise ValueError(f"Bono '{label}': 'liquidez' debe estar entre 0 y 1.")
+
+        return cls(
+            isin=str(entry["isin"]).strip(),
+            emisor=str(entry["emisor"]).strip(),
+            rating=rating,
+            coupon_rate=coupon,
+            maturity_date=maturity.strftime("%Y-%m-%d"),
+            ytm=float(entry["ytm"]) if entry.get("ytm") is not None else None,
+            price=float(entry["precio"]) if entry.get("precio") is not None else None,
+            spread_bp=float(entry["spread_bp"]) if entry.get("spread_bp") is not None else None,
+            freq=freq,
+            indexacion=str(entry.get("indexacion", "TF")).upper().strip(),
+            liquidez=liquidez,
+            sector=str(entry.get("sector", "Corporativo")),
+        )
+
+    @staticmethod
+    def list_from_config(
+        entries: Sequence[Mapping[str, object]], as_of: Union[str, datetime]
+    ) -> List["BondSpec"]:
+        """Convierte `BONOS_UNIVERSO` en bonos validados; rechaza ISIN repetidos."""
+        bonds = [BondSpec.from_config(e, as_of) for e in entries]
+        repeated = sorted({b.isin for b in bonds if sum(x.isin == b.isin for x in bonds) > 1})
+        if repeated:
+            raise ValueError(f"BONOS_UNIVERSO tiene identificadores repetidos: {repeated}.")
+        return bonds
+
 
 @dataclass
 class BondScreeningCriteria:
@@ -1341,54 +1602,6 @@ class BondScreener:
         self.report_: Optional[pd.DataFrame] = None
         self.approved_: List[AssetSpec] = []
         self.spread_paths_: Optional[pd.DataFrame] = None
-
-    # ------------------------------------------------------------------ #
-    # UNIVERSO DE BONOS
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def default_universe(as_of: Union[str, datetime] = "2021-01-01") -> List[BondSpec]:
-        """
-        Universo simulado de deuda pública y privada local, representativo de
-        lo que entregaría un proveedor de precios (PiP / Precia) o una mesa de
-        distribución. Sustituible por la lista real de ISINs sin cambiar el
-        resto del pipeline.
-
-        Los títulos en pesos se definen por su spread sobre la curva TES, de
-        modo que su YTM sea coherente con la curva cargada (histórica o
-        simulada). El TES UVR conserva su tasa real, que no es comparable con
-        la curva en pesos.
-        """
-        base = pd.Timestamp(as_of)
-
-        def mat(years: float) -> str:
-            return (base + pd.Timedelta(days=int(years * 365.25))).strftime("%Y-%m-%d")
-
-        return [
-            BondSpec("COL17CT02622", "Ministerio de Hacienda (TES)", "AAA", 0.0700, mat(3.5),
-                     spread_bp=3, freq=1, indexacion="TF", liquidez=0.95, sector="Soberano"),
-            BondSpec("COL17CT03000", "Ministerio de Hacienda (TES)", "AAA", 0.0725, mat(7.2),
-                     spread_bp=3, freq=1, indexacion="TF", liquidez=0.92, sector="Soberano"),
-            BondSpec("COL17CT03109", "Ministerio de Hacienda (TES UVR)", "AAA", 0.0325, mat(9.0),
-                     ytm=0.0365, freq=1, indexacion="UVR", liquidez=0.70, sector="Soberano"),
-            BondSpec("COB07CB00123", "Bancolombia", "AAA", 0.0810, mat(4.0),
-                     spread_bp=73, freq=2, indexacion="TF", liquidez=0.62, sector="Financiero"),
-            BondSpec("COB07CB00456", "Banco de Bogotá", "AAA", 0.0790, mat(2.5),
-                     spread_bp=68, freq=2, indexacion="TF", liquidez=0.58, sector="Financiero"),
-            BondSpec("COE12CB00777", "Empresas Públicas de Medellín", "AA+", 0.0865, mat(6.0),
-                     spread_bp=104, freq=1, indexacion="TF", liquidez=0.48, sector="Utilities"),
-            BondSpec("COI15CB00321", "Interconexión Eléctrica (ISA)", "AAA", 0.0840, mat(8.5),
-                     spread_bp=69, freq=1, indexacion="TF", liquidez=0.52, sector="Utilities"),
-            BondSpec("COG21CB00654", "Grupo Argos", "AA", 0.0925, mat(5.0),
-                     spread_bp=185, freq=1, indexacion="TF", liquidez=0.30, sector="Holding"),
-            BondSpec("COD09CB00888", "Davivienda", "AA+", 0.0880, mat(12.0),
-                     spread_bp=117, freq=2, indexacion="TF", liquidez=0.44, sector="Financiero"),
-            BondSpec("COT31CB00999", "Titularizadora Colombiana", "AA-", 0.0950, mat(6.5),
-                     spread_bp=244, freq=1, indexacion="TF", liquidez=0.22, sector="Titularizado"),
-            BondSpec("COA44CB00111", "Avianca", "BBB", 0.1150, mat(4.5),
-                     spread_bp=572, freq=2, indexacion="TF", liquidez=0.18, sector="Transporte"),
-            BondSpec("COC55CB00222", "Celsia", "AA+", 0.0895, mat(0.6),
-                     spread_bp=24, freq=1, indexacion="TF", liquidez=0.40, sector="Utilities"),
-        ]
 
     # ------------------------------------------------------------------ #
     # ANALÍTICA Y CRITERIOS DE ELEGIBILIDAD
@@ -1475,6 +1688,16 @@ class BondScreener:
         Aplica los filtros y construye el reporte de screening. Retorna un
         DataFrame con la analítica de cada título y su veredicto.
         """
+        # --- Sin bonos en BONOS_UNIVERSO: reporte vacío con las columnas esperadas ---
+        if not self.bonds:
+            self.report_ = pd.DataFrame(columns=[
+                "emisor", "sector", "rating", "indexacion", "cupon", "liquidez", "plazo_anios",
+                "ytm", "precio", "duracion_mod", "convexidad", "spread_bp", "aprobado",
+                "motivo_rechazo",
+            ]).astype({"aprobado": bool}).rename_axis("isin")
+            logger.info("BONOS_UNIVERSO está vacío: el Enfoque C (bonos individuales) no aporta activos.")
+            return self.report_
+
         # --- Analítica y veredicto por título ---
         rows: List[Dict[str, object]] = []
         for bond in self.bonds:
@@ -1596,7 +1819,7 @@ class BondScreener:
         self,
         shocks: CurveShockGenerator,
         specs: Optional[Sequence[AssetSpec]] = None,
-        spread_vol_bp: float = 2.0,
+        spread_vol_bp: Optional[float] = None,
         seed: int = 77,
     ) -> pd.DataFrame:
         """
@@ -1606,9 +1829,12 @@ class BondScreener:
 
             YTM_t = z_t(plazo_t) + spread_t,     plazo_t = plazo_0 − τ_t
 
-        donde z_t es la curva simulada de ese día y el spread sigue una
-        caminata aleatoria escalada por la (i)liquidez del título. El retorno
-        total incluye el cupón cobrado en el día:
+        donde z_t es la curva de ese día y el spread sigue una caminata
+        aleatoria escalada por la (i)liquidez del título, anclada para que en
+        la fecha de cotización (`as_of`) valga exactamente el spread que el
+        usuario ingresó; hacia atrás en el tiempo es una reconstrucción
+        simulada, ya que no hay precios históricos por bono. El retorno total
+        incluye el cupón cobrado en el día:
 
             r_t = (P_t + cupón_t) / P_{t−1} − 1
 
@@ -1624,6 +1850,7 @@ class BondScreener:
             raise RuntimeError("Ejecute simulate() o from_history() en el generador de choques primero.")
 
         # --- Calendario, curva y retorno de reinversión ---
+        vol_bp = BONOS_VOL_SPREAD_BP_DIARIA if spread_vol_bp is None else spread_vol_bp
         levels = shocks.levels_
         tenors = np.asarray(levels.columns, dtype=float)
         level_rows = levels.to_numpy()
@@ -1643,8 +1870,9 @@ class BondScreener:
 
             # --- Spread simulado (escalado por iliquidez) ---
             liq = float(spec.metadata.get("liquidez", 0.5))
-            spread_shock = rng.normal(0.0, (spread_vol_bp / 1e4) * (1.5 - liq), size=len(levels))
-            spread = float(spec.metadata["spread_bp"]) / 1e4 + np.cumsum(spread_shock)
+            spread_shock = rng.normal(0.0, (vol_bp / 1e4) * (1.5 - liq), size=len(levels))
+            walk = np.cumsum(spread_shock)
+            spread = float(spec.metadata["spread_bp"]) / 1e4 + (walk - walk[-1])
 
             # --- YTM diaria: curva al plazo residual + spread ---
             ttm = np.maximum(ttm0 - tau, 0.0)
@@ -1752,6 +1980,9 @@ class BondScreener:
         # --- Puntos del universo por veredicto ---
         report = self.report_ if self.report_ is not None else self.screen()
         fig = go.Figure()
+        if report.empty:
+            fig.update_layout(title="Screening de bonos individuales — BONOS_UNIVERSO está vacío")
+            return fig
         for aprobado, color, label in [(True, "seagreen", "Aprobado"), (False, "indianred", "Rechazado")]:
             sub = report[report["aprobado"] == aprobado]
             if sub.empty:
@@ -1824,6 +2055,8 @@ class FixedIncomeEngine:
         as_of: Optional[Union[str, datetime]] = None,
         include_rolldown: bool = True,
     ) -> None:
+        # `as_of` es la fecha de las cotizaciones de los bonos (el cierre de los datos)
+        # y `curve` debe ser la curva TES de esa misma fecha.
         # --- Enfoque A: constructor de nodos TES ---
         self.curve = curve
         self.node_builder = TESNodeBuilder(curve, node_tenors, include_rolldown=include_rolldown)
@@ -1834,10 +2067,7 @@ class FixedIncomeEngine:
         self.shocks = CurveShockGenerator(curve, tenors, shock_config)
 
         # --- Enfoque C: screener de bonos individuales ---
-        self.screener = BondScreener(
-            bonds if bonds is not None else BondScreener.default_universe(as_of or "2021-01-01"),
-            criteria, curve, as_of,
-        )
+        self.screener = BondScreener(list(bonds or []), criteria, curve, as_of)
         self.bundle_: Optional[FixedIncomeBundle] = None
 
     # ------------------------------------------------------------------ #
@@ -2458,17 +2688,21 @@ class PortfolioOptimizer:
                 "clase": gc.label, "min": gc.min_weight, "peso": val, "max": gc.max_weight,
                 "cumple": bool(gc.min_weight - tol <= val <= gc.max_weight + tol),
             })
-        return pd.DataFrame(rows).set_index("clase")
+        return pd.DataFrame(rows).set_index("clase") if rows else pd.DataFrame()
 
     # ------------------------------------------------------------------ #
     # VISUALIZACIONES
     # ------------------------------------------------------------------ #
-    def plot_efficient_frontier(self, n_portfolios: int = 5000, seed: int = 7) -> go.Figure:
+    def plot_efficient_frontier(
+        self, n_portfolios: Optional[int] = None, seed: int = 7
+    ) -> go.Figure:
         """
-        Simula portafolios aleatorios long-only (Monte Carlo) **dentro de las
-        bandas por clase de activo** para trazar la nube de riesgo-retorno y la
-        frontera eficiente, superponiendo el portafolio de Máximo Sharpe.
+        Simula portafolios aleatorios long-only (Monte Carlo) dentro de las
+        restricciones vigentes (bandas y topes, si los hay) para trazar la nube
+        de riesgo-retorno y la frontera eficiente, superponiendo el portafolio
+        de Máximo Sharpe.
         """
+        n_portfolios = N_PORTAFOLIOS_FRONTERA if n_portfolios is None else n_portfolios
         # --- Simulación Monte Carlo de portafolios factibles ---
         rng = np.random.default_rng(seed)
         results = np.zeros((3, n_portfolios))
@@ -2486,7 +2720,7 @@ class PortfolioOptimizer:
                 size=5, color=results[2], colorscale="Viridis", opacity=0.5,
                 colorbar=dict(title="Sharpe"),
             ),
-            name="Portafolios simulados (dentro de bandas)", hoverinfo="skip",
+            name="Portafolios simulados (dentro de las restricciones)", hoverinfo="skip",
         ))
 
         # --- Portafolio de Máximo Sharpe ---
@@ -2773,7 +3007,7 @@ class WalkForwardBacktester:
                 "peso_max_obs": float(serie.max()),
                 "rebalanceos_en_banda": f"{int(ok.sum())}/{len(ok)}",
             })
-        return pd.DataFrame(rows).set_index("clase")
+        return pd.DataFrame(rows).set_index("clase") if rows else pd.DataFrame()
 
     # ------------------------------------------------------------------ #
     # VISUALIZACIONES
@@ -2789,7 +3023,7 @@ class WalkForwardBacktester:
         ))
         fig.add_hline(y=1.0, line=dict(color="gray", dash="dash", width=1))
         fig.update_layout(
-            title="Curva de Equity — Backtest Walk-Forward Multi-Activo (Máximo Sharpe con bandas)",
+            title="Curva de Equity — Backtest Walk-Forward Multi-Activo (Máximo Sharpe)",
             xaxis_title="Fecha", yaxis_title="Valor del Portafolio (base = 1.0)",
         )
         return fig
@@ -2922,77 +3156,98 @@ class WalkForwardBacktester:
 @dataclass
 class AllocationPolicy:
     """
-    Declaración de política de inversión: bandas estratégicas por clase de
-    activo y topes de concentración diferenciados por tipo de instrumento.
+    Restricciones del portafolio. Por defecto no hay ninguna más allá de "sin
+    ventas en corto y 100% invertido": el optimizador elige libremente y la
+    proporción RV/RF sale del resultado. Se pueden activar bandas por clase de
+    activo y topes de peso (general o por tipo de instrumento).
 
-    Los defaults provienen del bloque de PARÁMETROS EDITABLES de la cabecera.
+    Los defaults provienen de la sección 8 del bloque de configuración.
     """
 
-    banda_rv: Tuple[float, float] = field(default_factory=lambda: BANDA_RV)
-    banda_rf: Tuple[float, float] = field(default_factory=lambda: BANDA_RF)
-
-    max_peso_accion: float = field(default_factory=lambda: MAX_PESO_ACCION_INDIVIDUAL)
-    max_peso_etf_rv: float = field(default_factory=lambda: MAX_PESO_ETF_RV)
-    max_peso_etf_rf: float = field(default_factory=lambda: MAX_PESO_ETF_RF)
-    max_peso_nodo_tes: float = field(default_factory=lambda: MAX_PESO_NODO_TES)
-    max_peso_bono: float = field(default_factory=lambda: MAX_PESO_BONO_INDIVIDUAL)
+    bandas: Dict[str, Tuple[float, float]] = field(default_factory=lambda: dict(BANDAS_POR_CLASE))
+    max_peso_activo: Optional[float] = field(default_factory=lambda: MAX_PESO_POR_ACTIVO)
+    topes_por_tipo: Dict[str, Optional[float]] = field(default_factory=lambda: dict(TOPES_POR_TIPO))
 
     rf_tenor_years: float = field(default_factory=lambda: RF_TENOR_YEARS)
 
+    _TIPO_POR_SUBCLASE = {
+        AssetSubClass.RV_ACCION_LOCAL: "accion",
+        AssetSubClass.RV_ETF_LOCAL: "etf_rv",
+        AssetSubClass.RV_ETF_GLOBAL: "etf_rv",
+        AssetSubClass.RF_NODO_TES: "nodo_tes",
+        AssetSubClass.RF_ETF: "etf_rf",
+        AssetSubClass.RF_BONO: "bono",
+    }
+
+    # ------------------------------------------------------------------ #
+    def __post_init__(self) -> None:
+        valid_classes = {c.value for c in AssetClass}
+        unknown = set(self.bandas) - valid_classes
+        if unknown:
+            raise ValueError(f"BANDAS_POR_CLASE: clases desconocidas {sorted(unknown)}; "
+                             f"usa {sorted(valid_classes)}.")
+        unknown = set(self.topes_por_tipo) - set(self._TIPO_POR_SUBCLASE.values())
+        if unknown:
+            raise ValueError(f"TOPES_POR_TIPO: tipos desconocidos {sorted(unknown)}; "
+                             f"usa {sorted(set(self._TIPO_POR_SUBCLASE.values()))}.")
+        for label, cap in [("MAX_PESO_POR_ACTIVO", self.max_peso_activo), *self.topes_por_tipo.items()]:
+            if cap is not None and not 0.0 < cap <= 1.0:
+                raise ValueError(f"{label} debe estar en (0, 1] o ser None, no {cap}.")
+
     # ------------------------------------------------------------------ #
     def group_constraints(self) -> List[GroupConstraint]:
-        return [
-            GroupConstraint(AssetClass.RENTA_VARIABLE.value, *self.banda_rv),
-            GroupConstraint(AssetClass.RENTA_FIJA.value, *self.banda_rf),
-        ]
+        return [GroupConstraint(cls, lo, hi) for cls, (lo, hi) in self.bandas.items()]
 
     # ------------------------------------------------------------------ #
     def _cap_for(self, spec: AssetSpec) -> float:
-        return {
-            AssetSubClass.RV_ACCION_LOCAL: self.max_peso_accion,
-            AssetSubClass.RV_ETF_LOCAL: self.max_peso_etf_rv,
-            AssetSubClass.RV_ETF_GLOBAL: self.max_peso_etf_rv,
-            AssetSubClass.RF_NODO_TES: self.max_peso_nodo_tes,
-            AssetSubClass.RF_ETF: self.max_peso_etf_rf,
-            AssetSubClass.RF_BONO: self.max_peso_bono,
-        }[spec.sub_class]
+        cap = self.topes_por_tipo.get(self._TIPO_POR_SUBCLASE[spec.sub_class])
+        if cap is None:
+            cap = self.max_peso_activo
+        return 1.0 if cap is None else float(cap)
 
     def max_weights(self, specs: Mapping[str, AssetSpec]) -> Dict[str, float]:
-        """Tope individual de cada activo según su tipo de instrumento."""
+        """Tope individual de cada activo según su tipo de instrumento (1.0 = sin tope)."""
         return {tk: self._cap_for(spec) for tk, spec in specs.items()}
 
     # ------------------------------------------------------------------ #
     def validate(self, specs: Mapping[str, AssetSpec]) -> None:
         """
         Comprueba que cada banda sea alcanzable con los topes vigentes antes de
-        llegar al solver, y avisa si el mínimo exige concentrar el universo.
+        llegar al solver, y avisa si el máximo supera la capacidad del universo.
         """
         # --- Capacidad de cada clase frente a su banda ---
         caps = self.max_weights(specs)
-        for cls, (lo, hi) in ((AssetClass.RENTA_VARIABLE, self.banda_rv),
-                              (AssetClass.RENTA_FIJA, self.banda_rf)):
-            miembros = [tk for tk, sp in specs.items() if sp.asset_class is cls]
+        for cls_label, (lo, hi) in self.bandas.items():
+            miembros = [tk for tk, sp in specs.items() if sp.asset_class.value == cls_label]
             capacidad = sum(caps[tk] for tk in miembros)
             if capacidad < lo - 1e-9:
                 raise ValueError(
-                    f"Política infactible: la banda mínima de {cls.value} es {lo:.0%} pero sus "
+                    f"Política infactible: la banda mínima de {cls_label} es {lo:.0%} pero sus "
                     f"{len(miembros)} activos sólo admiten {capacidad:.0%} con los topes vigentes. "
-                    f"Suba los topes o amplíe el universo de {cls.value}."
+                    f"Suba los topes o amplíe el universo de {cls_label}."
                 )
             if capacidad < hi:
                 logger.warning(
                     "La banda máxima de %s (%.0f%%) supera la capacidad del universo (%.0f%%): "
-                    "el tope efectivo será %.0f%%.", cls.value, hi * 100, capacidad * 100,
+                    "el tope efectivo será %.0f%%.", cls_label, hi * 100, capacidad * 100,
                     capacidad * 100,
                 )
 
+        # --- Un tope general demasiado bajo no deja invertir el 100% ---
+        if sum(caps.values()) < 1.0 - 1e-9:
+            raise ValueError(
+                f"Política infactible: con los topes vigentes los {len(caps)} activos admiten sólo "
+                f"{sum(caps.values()):.0%} del portafolio. Suba los topes o amplíe el universo."
+            )
+
     # ------------------------------------------------------------------ #
     def describe(self) -> str:
-        return (f"RV {self.banda_rv[0]:.0%}–{self.banda_rv[1]:.0%} | "
-                f"RF {self.banda_rf[0]:.0%}–{self.banda_rf[1]:.0%} | "
-                f"topes: acción {self.max_peso_accion:.0%}, ETF RV {self.max_peso_etf_rv:.0%}, "
-                f"ETF RF {self.max_peso_etf_rf:.0%}, nodo TES {self.max_peso_nodo_tes:.0%}, "
-                f"bono {self.max_peso_bono:.0%}")
+        bands = " | ".join(f"{c} {lo:.0%}–{hi:.0%}" for c, (lo, hi) in self.bandas.items())
+        caps = [f"{t} {c:.0%}" for t, c in self.topes_por_tipo.items() if c is not None]
+        if self.max_peso_activo is not None:
+            caps.insert(0, f"general {self.max_peso_activo:.0%}")
+        return ((f"bandas: {bands}" if bands else "sin bandas por clase")
+                + " | " + (f"topes: {', '.join(caps)}" if caps else "sin topes por activo"))
 
 
 class InteractiveReport:
@@ -3059,19 +3314,115 @@ class InteractiveReport:
 
 
 # ==============================================================================
-# 12. EJECUCIÓN PRINCIPAL — DEMOSTRACIÓN INTEGRAL DEL MOTOR MULTI-ACTIVO
+# 12. EJECUCIÓN PRINCIPAL
 # ==============================================================================
 
+MODOS_EJECUCION = ("recomendacion", "validacion")
+
+
+def _resolver_ventana() -> Tuple[str, str]:
+    """Fechas de inicio y fin de los datos según la sección 2 de la configuración."""
+    end = pd.Timestamp(FECHA_FIN) if FECHA_FIN else pd.Timestamp.today().normalize()
+    if FECHA_INICIO:
+        start = pd.Timestamp(FECHA_INICIO)
+    else:
+        start = end - pd.Timedelta(days=int(round(HISTORIA_ANIOS * 365.25)))
+    if start >= end:
+        raise ValueError(
+            f"FECHA_INICIO ({start.date()}) debe ser anterior a FECHA_FIN ({end.date()})."
+        )
+    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+
+
+def _curva_historica_real(
+    start_date: str, end_date: str, plazos: Sequence[float], alertas: List[str]
+) -> Optional[pd.DataFrame]:
+    """
+    Histórico diario de la curva TES hasta `end_date`, o None si se usa la curva
+    simulada. Con PERMITIR_DATOS_SINTETICOS = False (modo para invertir) una
+    curva que no se pueda descargar, o que termine antes de la fecha de cierre,
+    detiene la corrida: la tasa libre de riesgo y todo el retorno de la renta
+    fija salen de ella y no deben inventarse.
+    """
+    if CURVA_TES_FUENTE == "simulada":
+        if not PERMITIR_DATOS_SINTETICOS:
+            raise ValueError(
+                "CURVA_TES_FUENTE = 'simulada' sólo sirve para pruebas: pon 'banrep' o "
+                "PERMITIR_DATOS_SINTETICOS = True."
+            )
+        return None
+    if CURVA_TES_FUENTE != "banrep":
+        raise ValueError(f"CURVA_TES_FUENTE debe ser 'banrep' o 'simulada', no '{CURVA_TES_FUENTE}'.")
+
+    # --- Descarga (con caché local) ---
+    try:
+        nodos = BanrepTESHistory(RUTA_CACHE_CURVA_TES).fetch(
+            pd.Timestamp(start_date) - pd.Timedelta(days=15), end_date
+        )
+        if nodos.empty:
+            raise ValueError("la serie de Banrep no trae datos en la ventana pedida")
+    except Exception as exc:
+        if not PERMITIR_DATOS_SINTETICOS:
+            raise RuntimeError(
+                f"No se pudo obtener la curva TES real del Banco de la República ({exc}). Revisa la "
+                "conexión a internet y vuelve a correr. La corrida se detiene porque con "
+                "PERMITIR_DATOS_SINTETICOS = False no se usa una curva simulada para invertir."
+            ) from exc
+        logger.warning(
+            "No se pudo obtener la curva TES histórica de Banrep (%s). Se usa la curva simulada: "
+            "los resultados de renta fija no reflejan el mercado.", exc,
+        )
+        alertas.append("Curva TES simulada: los resultados de renta fija NO reflejan el mercado.")
+        return None
+
+    # --- La curva debe llegar hasta la fecha de cierre ---
+    rezago = (pd.Timestamp(end_date) - nodos.index[-1]).days
+    if rezago > MAX_DIAS_DATOS_DESACTUALIZADOS:
+        msg = (f"La curva TES de Banrep llega hasta {nodos.index[-1].date()}, {rezago} días antes de "
+               f"FECHA_FIN ({end_date}); el máximo permitido es {MAX_DIAS_DATOS_DESACTUALIZADOS}.")
+        if not PERMITIR_DATOS_SINTETICOS:
+            raise RuntimeError(msg + " Vuelve a correr cuando Banrep publique datos más recientes.")
+        logger.warning(msg)
+        alertas.append(msg)
+    return BanrepTESHistory.complete_curve(nodos, plazos, CURVA_TES_TAU_NS)
+
+
+def _descripcion_activo(spec: AssetSpec) -> str:
+    """Nombre legible de un activo para las tablas de resultados."""
+    if spec.sub_class is AssetSubClass.RF_BONO:
+        return f"{spec.name} — ISIN {spec.metadata['isin']}, vence {spec.metadata['vencimiento']}"
+    return spec.name
+
+
 def main() -> None:
+    # ---------------------------------------------------------------- #
+    # 0) CONFIGURACIÓN: MODO, VENTANA, BONOS Y POLÍTICA
+    # ---------------------------------------------------------------- #
+    if MODO_EJECUCION not in MODOS_EJECUCION:
+        raise ValueError(f"MODO_EJECUCION debe ser uno de {MODOS_EJECUCION}, no '{MODO_EJECUCION}'.")
+    modo_validacion = MODO_EJECUCION == "validacion"
     os.makedirs(DIRECTORIO_SALIDA, exist_ok=True)
 
     logger.info("=" * 78)
-    logger.info("QUANT PM — MOTOR DE ASSET ALLOCATION MULTI-ACTIVO (RV + RF)")
+    logger.info("QUANT PM — MOTOR DE ASSET ALLOCATION MULTI-ACTIVO (RV + RF) — modo: %s", MODO_EJECUCION)
     logger.info("=" * 78)
+
+    start_date, end_date = _resolver_ventana()
+    alertas: List[str] = []
+    hoy = pd.Timestamp.today().normalize()
+    if not modo_validacion and (hoy - pd.Timestamp(end_date)).days > MAX_DIAS_DATOS_DESACTUALIZADOS:
+        msg = (f"FECHA_FIN = {end_date} es anterior a hoy ({hoy.date()}): el portafolio refleja el "
+               "mercado de esa fecha, no el actual. Pon FECHA_FIN = None para invertir hoy.")
+        logger.warning(msg)
+        alertas.append(msg)
+    logger.info("Ventana de datos: %s a %s.", start_date, end_date)
+
+    # --- Bonos individuales ingresados por el usuario (se validan antes de descargar nada) ---
+    bonos = BondSpec.list_from_config(BONOS_UNIVERSO, end_date)
+    logger.info("BONOS_UNIVERSO: %d bono(s) ingresado(s).", len(bonos))
 
     universe = AssetUniverse()
     policy = AllocationPolicy()
-    start_date, end_date = FECHA_INICIO, FECHA_FIN
 
     # ---------------------------------------------------------------- #
     # 1) PRECIOS DE MERCADO (RV + ETFs de RF — Enfoque B)
@@ -3093,17 +3444,39 @@ def main() -> None:
         return [tk for tk in tickers if tk not in pipeline.synthetic_tickers_]
 
     modo_demo = len(_reales(universe.rv_tickers)) < MIN_ACTIVOS_RV_REALES
+    if modo_demo and not PERMITIR_DATOS_SINTETICOS:
+        raise RuntimeError(
+            f"Sólo {len(_reales(universe.rv_tickers))} tickers de RV con precio real (mínimo "
+            f"{MIN_ACTIVOS_RV_REALES}). Revisa la conexión a internet y que yfinance esté instalado "
+            f"({'instalado' if _YFINANCE_AVAILABLE else 'NO instalado: pip install yfinance'}). "
+            "Para probar el código sin internet pon PERMITIR_DATOS_SINTETICOS = True; esos "
+            "resultados no sirven para invertir."
+        )
     if modo_demo:
         logger.warning(
             "MODO DEMOSTRACIÓN: sólo %d tickers de RV con precio real (< %d). Se optimiza sobre "
             "series sintéticas calibradas; los resultados no son inferencia de mercado.",
             len(_reales(universe.rv_tickers)), MIN_ACTIVOS_RV_REALES,
         )
+        alertas.append("MODO DEMOSTRACIÓN: series sintéticas, los resultados NO sirven para invertir.")
     if EXCLUIR_ACTIVOS_SIN_PRECIO_REAL and not modo_demo:
         rv_tickers, rf_etf_tickers = _reales(universe.rv_tickers), _reales(universe.rf_etf_tickers)
     else:
         rv_tickers, rf_etf_tickers = list(universe.rv_tickers), list(universe.rf_etf_tickers)
     tickers_mercado = rv_tickers + rf_etf_tickers
+
+    # --- Frescura de los precios frente a la fecha de cierre ---
+    ultimos_precios = {tk: s.index[-1] for tk, s in pipeline.raw_prices_.items()}
+    if ultimos_precios:
+        ultimo_precio = max(ultimos_precios.values())
+        rezago = (pd.Timestamp(end_date) - ultimo_precio).days
+        if rezago > MAX_DIAS_DATOS_DESACTUALIZADOS:
+            msg = (f"El último precio de mercado es del {ultimo_precio.date()}, {rezago} días antes de "
+                   f"FECHA_FIN ({end_date}); el máximo permitido es {MAX_DIAS_DATOS_DESACTUALIZADOS}.")
+            if not PERMITIR_DATOS_SINTETICOS:
+                raise RuntimeError(msg + " Revisa la fuente de datos (Yahoo Finance) y vuelve a correr.")
+            logger.warning(msg)
+            alertas.append(msg)
 
     # --- Registro de los activos sin precio real ---
     liquidez = pipeline.liquidity_report()
@@ -3128,29 +3501,17 @@ def main() -> None:
     logger.info("CURVA TES — TASA LIBRE DE RIESGO Y NODOS DE DURACIÓN")
 
     # --- Histórico diario de la curva (Banrep) ---
-    curve_history: Optional[pd.DataFrame] = None
     plazos_curva = sorted(set(float(t) for t in CURVA_TES_PLAZOS) | set(float(t) for t in universe.nodos_tes))
-    if CURVA_TES_FUENTE == "banrep":
-        try:
-            nodos_banrep = BanrepTESHistory(RUTA_CACHE_CURVA_TES).fetch(
-                pd.Timestamp(start_date) - pd.Timedelta(days=15), end_date
-            )
-            curve_history = BanrepTESHistory.complete_curve(nodos_banrep, plazos_curva, CURVA_TES_TAU_NS)
-        except Exception as exc:
-            logger.warning(
-                "No se pudo obtener la curva TES histórica de Banrep (%s). Se usa la curva simulada: "
-                "los resultados de renta fija no reflejan el mercado.", exc,
-            )
-    elif CURVA_TES_FUENTE != "simulada":
-        raise ValueError(f"CURVA_TES_FUENTE debe ser 'banrep' o 'simulada', no '{CURVA_TES_FUENTE}'.")
+    curve_history = _curva_historica_real(start_date, end_date, plazos_curva, alertas)
 
-    # --- Curva base al inicio de la ventana ---
+    # --- Curva base: la vigente en la fecha de cierre (donde se cotizan los bonos) ---
     if curve_history is not None:
-        fila_inicio =curve_history.loc[:start_date]
-        fila_inicio = fila_inicio.iloc[-1] if not fila_inicio.empty else curve_history.iloc[0]
-        curve = TESYieldCurve.from_levels(plazos_curva, fila_inicio.values)
+        fila_cierre = curve_history.loc[:end_date]
+        fila_cierre = fila_cierre.iloc[-1] if not fila_cierre.empty else curve_history.iloc[-1]
+        curve = TESYieldCurve.from_levels(plazos_curva, fila_cierre.values)
         logger.info("Curva TES: histórico real de Banrep (1, 5 y 10 años, completado con Nelson-Siegel "
-                    "τ=%.2f), %d días.", CURVA_TES_TAU_NS, len(curve_history))
+                    "τ=%.2f), %d días, hasta el %s.", CURVA_TES_TAU_NS, len(curve_history),
+                    curve_history.index[-1].date())
     else:
         curve = TESYieldCurve.from_config()
         logger.info("Curva TES: curva fija de configuración con choques simulados.")
@@ -3161,13 +3522,15 @@ def main() -> None:
     logger.info("-" * 78)
     logger.info("RENTA FIJA — NODOS TES (A) + ETFs/FICs (B) + BONOS FILTRADOS (C)")
 
-    # --- Construcción del motor de renta fija ---
+    # --- Construcción del motor de renta fija (bonos cotizados a la fecha de cierre) ---
     criteria = BondScreeningCriteria()
     fi_engine = FixedIncomeEngine(
         curve=curve,
         node_tenors=universe.nodos_tes,
+        bonds=bonos,
         criteria=criteria,
-        as_of=start_date,
+        as_of=end_date,
+        include_rolldown=INCLUIR_ROLLDOWN,
     )
     fi_bundle = fi_engine.build(
         dates=prices.index,
@@ -3185,10 +3548,11 @@ def main() -> None:
     )
 
     # --- Salida en consola: screening y analítica de RF ---
-    print("\n--- Screening de bonos individuales (Enfoque C) ---")
-    print(fi_bundle.screening_report[
-        ["emisor", "rating", "plazo_anios", "ytm", "duracion_mod", "spread_bp", "aprobado", "motivo_rechazo"]
-    ].round(4).to_string())
+    if not fi_bundle.screening_report.empty:
+        print("\n--- Screening de bonos individuales (Enfoque C) a la fecha de cierre ---")
+        print(fi_bundle.screening_report[
+            ["emisor", "rating", "plazo_anios", "ytm", "duracion_mod", "spread_bp", "aprobado", "motivo_rechazo"]
+        ].round(4).to_string())
     print("\n--- Analítica de activos de RF modelada (Enfoques A y C) ---")
     print(fi_bundle.analytics.round(4).to_string())
 
@@ -3230,10 +3594,10 @@ def main() -> None:
     print("\n" + risk_report.round(4).to_string())
 
     # ---------------------------------------------------------------- #
-    # 6) OPTIMIZACIÓN ESTRATÉGICA CON BANDAS POR CLASE DE ACTIVO
+    # 6) PORTAFOLIO ÓPTIMO A LA FECHA DE CIERRE
     # ---------------------------------------------------------------- #
     logger.info("-" * 78)
-    logger.info("OPTIMIZACIÓN MULTI-ACTIVO — MÁXIMO SHARPE CON BANDAS (%s)", policy.describe())
+    logger.info("OPTIMIZACIÓN MULTI-ACTIVO — MÁXIMO SHARPE (%s)", policy.describe())
     policy.validate(specs)
 
     # --- μ analítico de la RF al cierre ---
@@ -3272,18 +3636,59 @@ def main() -> None:
     weights_opt = optimizer.max_sharpe()
     ret_opt, vol_opt = optimizer._portfolio_perf(weights_opt.values)
 
-    # --- Tabla de pesos y cumplimiento de bandas ---
+    # --- Tabla de pesos (con montos si hay capital) ---
     tabla_pesos = pd.DataFrame({
-        "peso_%": (weights_opt * 100).round(2),
+        "activo": [_descripcion_activo(specs[t]) for t in weights_opt.index],
         "clase": [specs[t].asset_class.value for t in weights_opt.index],
         "sub_clase": [specs[t].sub_class.value for t in weights_opt.index],
-    }).sort_values("peso_%", ascending=False)
-    print("\n--- Portafolio estratégico óptimo ---")
-    print(tabla_pesos[tabla_pesos["peso_%"] > 0.01].to_string())
-    print("\n--- Exposición por clase de activo ---")
-    print((optimizer.group_exposure(weights_opt) * 100).round(2).to_string())
-    print("\n--- Cumplimiento de bandas ---")
-    print(optimizer.constraints_check(weights_opt).to_string())
+        "peso_%": (weights_opt * 100).round(2),
+    }, index=weights_opt.index)
+    if CAPITAL_INVERSION_COP:
+        tabla_pesos["monto_COP"] = (weights_opt * CAPITAL_INVERSION_COP).round(0)
+    tabla_pesos = tabla_pesos.sort_values("peso_%", ascending=False)
+    tabla_pesos_visible = tabla_pesos[tabla_pesos["peso_%"] > PESO_MIN_REPORTE_PCT]
+
+    # --- Distribución resultante por clase y sub-clase (RV vs RF sale del optimizador) ---
+    def _distribucion(grupos: Mapping[str, str]) -> pd.DataFrame:
+        dist = (weights_opt.groupby(pd.Series(grupos)).sum() * 100).rename("peso_%").to_frame()
+        if CAPITAL_INVERSION_COP:
+            dist["monto_COP"] = (dist["peso_%"] / 100 * CAPITAL_INVERSION_COP).round(0)
+        return dist.sort_values("peso_%", ascending=False)
+
+    dist_clase = _distribucion({t: specs[t].asset_class.value for t in weights_opt.index})
+    dist_subclase = _distribucion({t: specs[t].sub_class.value for t in weights_opt.index})
+
+    # --- Concentración y resumen del portafolio ---
+    hhi = float((weights_opt ** 2).sum())
+    n_activos = int((weights_opt > 1e-4).sum())
+    resumen = pd.Series({
+        "retorno_esperado_anual_%": float(np.expm1(ret_opt) * 100),
+        "volatilidad_anual_%": float(vol_opt * 100),
+        "sharpe_esperado": float((ret_opt - optimizer.rf_log_) / vol_opt),
+        "tasa_libre_de_riesgo_%": float(rf_tes * 100),
+        "numero_de_activos": n_activos,
+        "activos_efectivos_(1/HHI)": 1.0 / hhi,
+        "mayor_peso_%": float(weights_opt.max() * 100),
+    }, name="valor")
+    if not policy.bandas and policy.max_peso_activo is None and not any(policy.topes_por_tipo.values()):
+        if n_activos < 4 or weights_opt.max() > 0.5:
+            alertas.append(
+                f"Sin bandas ni topes el portafolio quedó concentrado ({n_activos} activos; "
+                f"mayor peso {weights_opt.max():.0%} en {weights_opt.idxmax()}). Si quieres más "
+                "diversificación, activa topes o bandas en la sección 8 de la configuración."
+            )
+
+    print(f"\n--- Portafolio óptimo al {fecha_cierre.date()} ---")
+    print(tabla_pesos_visible.to_string())
+    print("\n--- Distribución por clase de activo (resultado del optimizador) ---")
+    print(dist_clase.round(2).to_string())
+    print("\n--- Distribución por sub-clase ---")
+    print(dist_subclase.round(2).to_string())
+    if policy.bandas:
+        print("\n--- Cumplimiento de bandas ---")
+        print(optimizer.constraints_check(weights_opt).to_string())
+    print("\n--- Resumen del portafolio ---")
+    print(resumen.round(4).to_string())
 
     # --- Diagnóstico de shrinkage y métricas del óptimo ---
     logger.info(
@@ -3295,94 +3700,124 @@ def main() -> None:
                     clase, phi)
     logger.info(
         "Óptimo — retorno esp.: %.2f%% | vol: %.2f%% | Sharpe: %.4f | activos con peso > 0: %d",
-        ret_opt * 100, vol_opt * 100, (ret_opt - optimizer.rf_log_) / vol_opt, int((weights_opt > 1e-4).sum()),
+        ret_opt * 100, vol_opt * 100, (ret_opt - optimizer.rf_log_) / vol_opt, n_activos,
     )
 
+    # --- Calidad y frescura de los datos al cierre ---
+    estado_cierre = {tk: motivos_cierre.get(tk, "elegible") for tk in tickers_mercado}
+    estado_cierre.update({tk: motivos_exclusion[tk] for tk in descartados})
+    if not liquidez.empty:
+        tabla_liquidez = liquidez.assign(
+            primer_dato=liquidez["primer_dato"].dt.date,
+            ultimo_dato=liquidez["ultimo_dato"].dt.date,
+            dias_de_rezago=(fecha_cierre - liquidez["ultimo_dato"]).dt.days,
+            estado_al_cierre=[estado_cierre.get(tk, "—") for tk in liquidez.index],
+        ).sort_values("pct_sin_movimiento", ascending=False)
+    else:
+        tabla_liquidez = pd.DataFrame()
+
+    # Salida: copia del portafolio recomendado para abrir en Excel
+    ruta_csv = os.path.join(DIRECTORIO_SALIDA, "portafolio_recomendado.csv")
+    tabla_pesos_visible.to_csv(ruta_csv, index_label="ticker", encoding="utf-8-sig")
+
     # ---------------------------------------------------------------- #
-    # 7) BACKTEST WALK-FORWARD MULTI-ACTIVO
+    # 7) BACKTEST WALK-FORWARD (sólo en modo "validacion")
     # ---------------------------------------------------------------- #
-    logger.info("-" * 78)
-    logger.info("BACKTEST WALK-FORWARD FUERA DE MUESTRA CON BANDAS RV/RF")
+    backtester = None
+    if modo_validacion:
+        logger.info("-" * 78)
+        logger.info("BACKTEST WALK-FORWARD FUERA DE MUESTRA")
 
-    # --- Universo invertible en cada rebalanceo (sólo datos de la ventana) ---
-    motivos_por_fecha: Dict[pd.Timestamp, Dict[str, str]] = {}
+        # --- Universo invertible en cada rebalanceo (sólo datos de la ventana) ---
+        motivos_por_fecha: Dict[pd.Timestamp, Dict[str, str]] = {}
 
-    def no_invertibles(fecha: pd.Timestamp, inicio_ventana: pd.Timestamp) -> Set[str]:
-        motivos = pipeline.tradability_issues_at(fecha, inicio_ventana, tickers_mercado)
-        motivos_por_fecha[pd.Timestamp(fecha)] = motivos
-        return set(motivos) | fi_engine.excluded_bonds_at(fecha)
+        def no_invertibles(fecha: pd.Timestamp, inicio_ventana: pd.Timestamp) -> Set[str]:
+            motivos = pipeline.tradability_issues_at(fecha, inicio_ventana, tickers_mercado)
+            motivos_por_fecha[pd.Timestamp(fecha)] = motivos
+            return set(motivos) | fi_engine.excluded_bonds_at(fecha)
 
-    # --- Configuración y ejecución del backtest ---
-    backtester = WalkForwardBacktester(
-        multi_prices,
-        lookback_days=LOOKBACK_DIAS,
-        rebalance_freq=FRECUENCIA_REBALANCEO,
-        rf=rf_tes,
-        max_weight=policy.max_weights(specs),
-        shrinkage=USAR_SHRINKAGE_LEDOIT_WOLF,
-        asset_specs=specs,
-        group_constraints=policy.group_constraints(),
-        expected_returns_fn=lambda d: np.log1p(fi_engine.expected_returns_at(d)),
-        rf_fn=lambda d: fi_engine.risk_free_at(d, policy.rf_tenor_years),
-        exclude_fn=no_invertibles,
-        window_fn=fi_engine.proforma_log_returns,
-    )
-    weights_history = backtester.run()
-    perf_summary = backtester.performance_summary()
+        # --- Configuración y ejecución del backtest ---
+        backtester = WalkForwardBacktester(
+            multi_prices,
+            lookback_days=LOOKBACK_DIAS,
+            rebalance_freq=FRECUENCIA_REBALANCEO,
+            rf=rf_tes,
+            max_weight=policy.max_weights(specs),
+            shrinkage=USAR_SHRINKAGE_LEDOIT_WOLF,
+            asset_specs=specs,
+            group_constraints=policy.group_constraints(),
+            expected_returns_fn=lambda d: np.log1p(fi_engine.expected_returns_at(d)),
+            rf_fn=lambda d: fi_engine.risk_free_at(d, policy.rf_tenor_years),
+            exclude_fn=no_invertibles,
+            window_fn=fi_engine.proforma_log_returns,
+        )
+        weights_history = backtester.run()
+        perf_summary = backtester.performance_summary()
 
-    # --- Elegibilidad por activo a lo largo del backtest ---
-    def _tabla_elegibilidad(tickers: Sequence[str]) -> pd.DataFrame:
-        elegibles = pd.DataFrame({
-            d: {tk: tk not in excl for tk in tickers} for d, excl in backtester.excluded_history_.items()
-        }).T
-        fechas_elegible = {tk: elegibles.index[elegibles[tk]] for tk in tickers}
-        return pd.DataFrame({
-            "rebalanceos_elegible": {tk: f"{int(elegibles[tk].sum())}/{len(elegibles)}" for tk in tickers},
-            "primer_rebalanceo": {tk: (f[0].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
-            "ultimo_rebalanceo": {tk: (f[-1].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
-            "peso_medio_%_cuando_elegible": {
-                tk: (float(weights_history.loc[f, tk].mean() * 100) if len(f) and tk in weights_history else 0.0)
-                for tk, f in fechas_elegible.items()
-            },
-        })
+        # --- Elegibilidad por activo a lo largo del backtest ---
+        def _tabla_elegibilidad(tickers: Sequence[str]) -> pd.DataFrame:
+            elegibles = pd.DataFrame({
+                d: {tk: tk not in excl for tk in tickers} for d, excl in backtester.excluded_history_.items()
+            }).T
+            fechas_elegible = {tk: elegibles.index[elegibles[tk]] for tk in tickers}
+            return pd.DataFrame({
+                "rebalanceos_elegible": {tk: f"{int(elegibles[tk].sum())}/{len(elegibles)}" for tk in tickers},
+                "primer_rebalanceo": {tk: (f[0].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
+                "ultimo_rebalanceo": {tk: (f[-1].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
+                "peso_medio_%_cuando_elegible": {
+                    tk: (float(weights_history.loc[f, tk].mean() * 100) if len(f) and tk in weights_history else 0.0)
+                    for tk, f in fechas_elegible.items()
+                },
+            })
 
-    bonos = [tk for tk, sp in specs.items() if sp.sub_class is AssetSubClass.RF_BONO]
-    tabla_elegibilidad = _tabla_elegibilidad(bonos)
-    tabla_elegibilidad.insert(0, "vencimiento", {tk: specs[tk].metadata["vencimiento"] for tk in bonos})
+        bonos_en_matriz = [tk for tk, sp in specs.items() if sp.sub_class is AssetSubClass.RF_BONO]
+        tabla_elegibilidad = pd.DataFrame()
+        if bonos_en_matriz:
+            tabla_elegibilidad = _tabla_elegibilidad(bonos_en_matriz)
+            tabla_elegibilidad.insert(0, "vencimiento", {tk: specs[tk].metadata["vencimiento"]
+                                                         for tk in bonos_en_matriz})
 
-    # --- Universo de mercado: motivo de exclusión más frecuente y al cierre ---
-    def _categoria(motivo: str) -> str:
-        return motivo.split(":")[0].split(" desde")[0]
+        # --- Universo de mercado: motivo de exclusión más frecuente y al cierre ---
+        def _categoria(motivo: str) -> str:
+            return motivo.split(":")[0].split(" desde")[0]
 
-    tabla_universo = _tabla_elegibilidad(tickers_mercado)
-    ultima_fecha = max(motivos_por_fecha)
-    tabla_universo["motivo_principal"] = {
-        tk: (pd.Series([_categoria(m[tk]) for m in motivos_por_fecha.values() if tk in m]).mode().iloc[0]
-             if any(tk in m for m in motivos_por_fecha.values()) else "—")
-        for tk in tickers_mercado
-    }
-    tabla_universo["estado_ultimo_rebalanceo"] = {
-        tk: motivos_por_fecha[ultima_fecha].get(tk, "elegible") for tk in tickers_mercado
-    }
-    for tk in tickers_mercado:
-        motivos_exclusion.setdefault(tk, f"elegible en {tabla_universo.loc[tk, 'rebalanceos_elegible']} rebalanceos")
+        tabla_universo = _tabla_elegibilidad(tickers_mercado)
+        ultima_fecha = max(motivos_por_fecha)
+        tabla_universo["motivo_principal"] = {
+            tk: (pd.Series([_categoria(m[tk]) for m in motivos_por_fecha.values() if tk in m]).mode().iloc[0]
+                 if any(tk in m for m in motivos_por_fecha.values()) else "—")
+            for tk in tickers_mercado
+        }
+        tabla_universo["estado_ultimo_rebalanceo"] = {
+            tk: motivos_por_fecha[ultima_fecha].get(tk, "elegible") for tk in tickers_mercado
+        }
 
-    # --- Salida en consola del backtest ---
-    print("\n--- Asignación por clase de activo en cada rebalanceo (%) ---")
-    print((backtester.class_weights_history_ * 100).round(2).to_string())
-    print("\n--- Composición interna de la Renta Fija (%) ---")
-    rf_subs = [s.value for s in (AssetSubClass.RF_NODO_TES, AssetSubClass.RF_ETF, AssetSubClass.RF_BONO)]
-    print((backtester.subclass_weights_history_[
-        [c for c in rf_subs if c in backtester.subclass_weights_history_.columns]
-    ] * 100).round(2).to_string())
-    print("\n--- Cumplimiento de bandas a lo largo del backtest ---")
-    print(backtester.band_compliance().to_string())
-    print("\n--- Desempeño fuera de muestra ---")
-    print(pd.Series(perf_summary, name="valor").round(4).to_string())
-    print("\n--- Elegibilidad de bonos en el backtest (screening dinámico) ---")
-    print(tabla_elegibilidad.round(2).to_string())
-    print("\n--- Universo de mercado en el backtest (liquidez y cobertura en la ventana de cada rebalanceo) ---")
-    print(tabla_universo.round(2).to_string())
+        # --- Salida en consola del backtest ---
+        print("\n--- Asignación por clase de activo en cada rebalanceo (%) ---")
+        print((backtester.class_weights_history_ * 100).round(2).to_string())
+        print("\n--- Composición interna de la Renta Fija (%) ---")
+        rf_subs = [s.value for s in (AssetSubClass.RF_NODO_TES, AssetSubClass.RF_ETF, AssetSubClass.RF_BONO)]
+        print((backtester.subclass_weights_history_[
+            [c for c in rf_subs if c in backtester.subclass_weights_history_.columns]
+        ] * 100).round(2).to_string())
+        if policy.bandas:
+            print("\n--- Cumplimiento de bandas a lo largo del backtest ---")
+            print(backtester.band_compliance().to_string())
+        print("\n--- Desempeño fuera de muestra ---")
+        print(pd.Series(perf_summary, name="valor").round(4).to_string())
+        if not tabla_elegibilidad.empty:
+            print("\n--- Elegibilidad de bonos en el backtest (screening dinámico) ---")
+            print(tabla_elegibilidad.round(2).to_string())
+        print("\n--- Universo de mercado en el backtest (liquidez y cobertura en la ventana de cada rebalanceo) ---")
+        print(tabla_universo.round(2).to_string())
+
+        # --- Estado de elegibilidad en el backtest para la tabla de liquidez ---
+        if not tabla_liquidez.empty:
+            tabla_liquidez["elegibilidad_backtest"] = [
+                (f"elegible en {tabla_universo.loc[tk, 'rebalanceos_elegible']} rebalanceos"
+                 if tk in tabla_universo.index else "—")
+                for tk in tabla_liquidez.index
+            ]
 
     # ---------------------------------------------------------------- #
     # 8) REPORTE HTML INTERACTIVO
@@ -3391,21 +3826,29 @@ def main() -> None:
     # --- Cabecera y notas metodológicas ---
     report = InteractiveReport(
         "Quant PM — Motor de Asset Allocation Multi-Activo (RV + RF)",
-        f"Universo: {n_rv} activos de Renta Variable y {n_rf} de Renta Fija | "
-        f"Rango: {start_date} a {end_date} | Política: {policy.describe()}",
+        f"Datos al {fecha_cierre.date()} | Modo: {MODO_EJECUCION} | Universo: {n_rv} activos de "
+        f"Renta Variable y {n_rf} de Renta Fija | Rango: {start_date} a {end_date} | "
+        f"Restricciones: {policy.describe()}",
     )
+    for alerta in alertas:
+        report.add_note(f"<b>⚠ Alerta.</b> {alerta}")
     n_nodos = sum(1 for sp in specs.values() if sp.sub_class is AssetSubClass.RF_NODO_TES)
     n_bonos = sum(1 for sp in specs.values() if sp.sub_class is AssetSubClass.RF_BONO)
     nota_b = (f"<b>(B)</b> {len(rf_etf_tickers)} ETF/FIC con precio líquido de mercado"
               if rf_etf_tickers else
               "<b>(B)</b> sin ETFs/FICs en esta corrida — ningún vehículo del universo tiene "
               "precio observable en la fuente de datos")
+    nota_c = (f"<b>(C)</b> {n_bonos} bonos individuales que ingresaste y superan el filtro de rating, "
+              "plazo, liquidez y spread"
+              if n_bonos else
+              "<b>(C)</b> sin bonos individuales: BONOS_UNIVERSO está vacío o ninguno es candidato")
     report.add_note(
         "<b>Curva TES.</b> "
         + ("Histórico diario real de las tasas cero cupón TES en pesos a 1, 5 y 10 años del Banco "
            "de la República (SUAMECA), completado a todos los plazos con Nelson-Siegel "
-           f"(τ = {CURVA_TES_TAU_NS:g} años). Los spreads de crédito de los bonos siguen siendo "
-           "simulados: no hay una fuente pública de precios históricos por título."
+           f"(τ = {CURVA_TES_TAU_NS:g} años). Los spreads de crédito de los bonos se anclan a la "
+           "cotización que ingresaste en la fecha de los datos; hacia atrás son simulados, porque "
+           "no hay una fuente pública de precios históricos por título."
            if fi_engine.shocks.source_ == "histórica" else
            "<b>Simulada</b> alrededor de una curva fija de configuración: los resultados de renta "
            "fija no reflejan episodios reales del mercado.")
@@ -3414,24 +3857,33 @@ def main() -> None:
         "<b>Arquitectura de Renta Fija.</b> La pata de RF combina tres vías: "
         f"<b>(A)</b> {n_nodos} nodos sintéticos de la curva TES, cuyo retorno diario se modela por "
         "duración modificada y convexidad — ΔP/P ≈ −D·Δy + ½·C·(Δy)²; "
-        f"{nota_b}; y "
-        f"<b>(C)</b> {n_bonos} bonos individuales que superan el filtro de rating, plazo, liquidez "
-        "y spread. El μ de (A) y (C) es analítico (YTM + roll-down), no una media muestral, y se "
-        "recalcula con la curva vigente en cada rebalanceo. Los bonos envejecen: se revalúan a "
-        "diario con su plazo residual, el screening se repite en cada rebalanceo (un título entra "
-        "o sale según su plazo y spread vigentes) y su covarianza se estima con retornos pro-forma "
-        "que aplican los choques históricos a su duración actual."
+        f"{nota_b}; y {nota_c}. El μ de (A) y (C) es analítico (YTM + roll-down), no una media "
+        "muestral. Los bonos envejecen: el screening se repite en cada fecha de decisión y su "
+        "covarianza se estima con retornos pro-forma que aplican los choques históricos a su "
+        "duración actual."
     )
     report.add_note(
         "<b>Integridad de datos.</b> "
         + ("Se excluyeron del universo los activos sin precio real: "
            + "; ".join(f"<b>{tk}</b>" for tk in descartados) + ". " if descartados else "")
-        + "La historia, la cotización reciente y la liquidez se evalúan en cada rebalanceo sólo con "
-        f"los precios de su ventana de estimación ({LOOKBACK_DIAS} días): un título entra o sale "
-        "según su comportamiento hasta esa fecha, sin usar información posterior. El motor no "
-        "sustituye precios faltantes por series simuladas dentro del optimizador, ni admite títulos "
-        "cuyo precio congelado haría parecer su riesgo menor al real."
+        + "La historia, la cotización reciente y la liquidez se evalúan sólo con los precios de la "
+        f"ventana de estimación ({LOOKBACK_DIAS} días). El motor no sustituye precios faltantes por "
+        "series simuladas dentro del optimizador, ni admite títulos cuyo precio congelado haría "
+        "parecer su riesgo menor al real."
     )
+
+    # --- Sección: portafolio óptimo ---
+    cap_txt = (f" — capital {CAPITAL_INVERSION_COP:,.0f} COP" if CAPITAL_INVERSION_COP else "")
+    report.add_table(f"Portafolio óptimo al {fecha_cierre.date()} (peso > {PESO_MIN_REPORTE_PCT:g}%){cap_txt}",
+                     tabla_pesos_visible, "{:,.2f}")
+    report.add_table("Distribución por clase de activo (RV vs RF, resultado del optimizador)",
+                     dist_clase, "{:,.2f}")
+    report.add_table("Distribución por sub-clase", dist_subclase, "{:,.2f}")
+    report.add_table("Resumen del portafolio", resumen.to_frame(), "{:,.4f}")
+    if policy.bandas:
+        report.add_table("Cumplimiento de bandas — portafolio óptimo",
+                         optimizer.constraints_check(weights_opt), "{:.4f}")
+    report.add_chart("Frontera Eficiente Multi-Activo", optimizer.plot_efficient_frontier())
 
     # --- Sección: curva TES y renta fija ---
     curva_cierre = fi_engine.shocks.curve_at(multi_returns.index[-1])
@@ -3443,57 +3895,53 @@ def main() -> None:
         "Analítica de la Renta Fija modelada (μ, YTM, duración, convexidad)",
         fi_bundle.analytics.drop(columns=[c for c in ("nombre",) if c in fi_bundle.analytics.columns]),
     )
-    report.add_table(
-        "Screening de bonos — veredicto por título (al inicio de la ventana)",
-        fi_bundle.screening_report[
-            ["emisor", "rating", "plazo_anios", "ytm", "duracion_mod", "spread_bp",
-             "liquidez", "aprobado", "motivo_rechazo"]
-        ],
-    )
-    report.add_table(
-        "Screening dinámico — elegibilidad de cada bono en los rebalanceos",
-        tabla_elegibilidad, "{:.2f}",
-    )
-    report.add_table(
-        "Universo de mercado — elegibilidad por liquidez y cobertura en los rebalanceos",
-        tabla_universo, "{:.2f}",
-    )
+    if not fi_bundle.screening_report.empty:
+        report.add_table(
+            "Screening de bonos — veredicto por título (a la fecha de cierre)",
+            fi_bundle.screening_report[
+                ["emisor", "rating", "plazo_anios", "ytm", "duracion_mod", "spread_bp",
+                 "liquidez", "aprobado", "motivo_rechazo"]
+            ],
+        )
 
-    # --- Sección: optimización estratégica ---
-    report.add_chart("Frontera Eficiente Multi-Activo", optimizer.plot_efficient_frontier(n_portfolios=3000))
-    report.add_table("Portafolio estratégico óptimo (peso > 0.01%)",
-                     tabla_pesos[tabla_pesos["peso_%"] > 0.01], "{:.2f}")
-    report.add_table("Cumplimiento de bandas — portafolio estratégico",
-                     optimizer.constraints_check(weights_opt), "{:.4f}")
+    # --- Sección: backtest walk-forward (modo "validacion") ---
+    if backtester is not None:
+        if not tabla_elegibilidad.empty:
+            report.add_table(
+                "Screening dinámico — elegibilidad de cada bono en los rebalanceos",
+                tabla_elegibilidad, "{:.2f}",
+            )
+        report.add_table(
+            "Universo de mercado — elegibilidad por liquidez y cobertura en los rebalanceos",
+            tabla_universo, "{:.2f}",
+        )
+        report.add_chart("Asignación Estratégica: Total RF vs Total RV",
+                         backtester.plot_asset_class_evolution())
+        report.add_chart("Composición Interna de la Renta Fija (Nodos TES / ETFs / Bonos)",
+                         backtester.plot_fixed_income_breakdown())
+        report.add_chart("Renta Fija — Peso relativo dentro de la clase",
+                         backtester.plot_fixed_income_breakdown(normalize=True))
+        report.add_chart("Renta Fija — Detalle por instrumento", backtester.plot_fixed_income_assets())
+        report.add_chart("Evolución de Pesos por Activo", backtester.plot_weights_evolution())
+        report.add_chart("Curva de Equity — Backtest Walk-Forward", backtester.plot_equity_curve())
+        report.add_table("Desempeño fuera de muestra", pd.DataFrame(perf_summary, index=["valor"]).T)
+        if policy.bandas:
+            report.add_table("Cumplimiento de bandas en el backtest", backtester.band_compliance(), "{:.4f}")
 
-    # --- Sección: backtest walk-forward ---
-    report.add_chart("Asignación Estratégica: Total RF vs Total RV",
-                     backtester.plot_asset_class_evolution())
-    report.add_chart("Composición Interna de la Renta Fija (Nodos TES / ETFs / Bonos)",
-                     backtester.plot_fixed_income_breakdown())
-    report.add_chart("Renta Fija — Peso relativo dentro de la clase",
-                     backtester.plot_fixed_income_breakdown(normalize=True))
-    report.add_chart("Renta Fija — Detalle por instrumento", backtester.plot_fixed_income_assets())
-    report.add_chart("Evolución de Pesos por Activo", backtester.plot_weights_evolution())
-    report.add_chart("Curva de Equity — Backtest Walk-Forward", backtester.plot_equity_curve())
-    report.add_table("Desempeño fuera de muestra", pd.DataFrame(perf_summary, index=["valor"]).T)
-
-    # --- Sección: riesgo micro y liquidez ---
+    # --- Sección: riesgo micro y calidad de datos ---
     report.add_table("Métricas de riesgo micro por activo", risk_report)
-    if not liquidez.empty:
-        tabla_liquidez = liquidez.assign(
-            primer_dato=liquidez["primer_dato"].dt.date,
-            ultimo_dato=liquidez["ultimo_dato"].dt.date,
-            estado=[motivos_exclusion.get(tk, "—") for tk in liquidez.index],
-        ).sort_values("pct_sin_movimiento", ascending=False)
-        report.add_table("Liquidez y cobertura de precios por ticker (ventana completa)",
+    if not tabla_liquidez.empty:
+        report.add_table("Calidad de datos — liquidez, cobertura y frescura por ticker",
                          tabla_liquidez, "{:.3f}")
 
     # --- Escritura del reporte ---
-    report_path = report.write(os.path.join(DIRECTORIO_SALIDA, "reporte_interactivo.html"))
+    report_path = report.write(os.path.join(DIRECTORIO_SALIDA, NOMBRE_REPORTE_HTML))
 
     logger.info("=" * 78)
+    for alerta in alertas:
+        logger.warning("ALERTA: %s", alerta)
     logger.info("Ejecución completa. Reporte interactivo: %s", report_path)
+    logger.info("Portafolio recomendado (CSV): %s", ruta_csv)
     logger.info("=" * 78)
 
 
