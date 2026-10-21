@@ -84,6 +84,8 @@ With the simulated curve, daily changes come from a **three-factor Nelson-Siegel
 The expected return (μ) of A and C is **analytical** (YTM + roll-down), not a sample mean. It is recomputed from the curve in force at each rebalance date, which is the tactical part of the allocation.
 
 ### 4. Unified multi-asset matrix
+Assets quoted in dollars (`ACTIVOS_EN_USD`: SPY, QQQ and TLT by default) are converted to pesos with the daily USD/COP rate (`TICKER_USDCOP`, Yahoo Finance `COP=X`), so their returns and risk include the exchange-rate effect, as they do for an investor in pesos. If the rate cannot be downloaded, those assets are left out and the report says so. The S&P 500 benchmark used for betas stays in dollars.
+
 Equity prices, bond-ETF prices and the modeled fixed-income series are aligned by date into one price and return matrix.
 
 ### 5. Per-asset risk metrics (`RiskMetrics`)
@@ -172,6 +174,7 @@ All settings live in the **CONFIGURACIÓN (set up)** block at the top of the scr
 ## Known limitations
 
 - **Only three curve nodes are observed.** Banrep publishes the 1, 5 and 10-year rates; tenors outside that range (below 1 year, above 10) are Nelson-Siegel extrapolations.
+- **A sovereign bond's rate is the curve's.** Enter TES with `"spread_bp": 0` (they follow the closing-date curve) or with a `ytm` of that same date; a stale rate inflates the bond's expected return and biases the optimizer toward it.
 - **Credit-spread history is simulated.** Individual bonds follow the real TES curve and their spread is anchored to your quote at the closing date, but before that date it is a random-walk reconstruction (the daily spread volatility is `BONOS_VOL_SPREAD_BP_DIARIA`); there is no public source of historical prices per bond. A bond is also assumed to have existed throughout the window.
 - **Bayes-Stein reduces, but does not remove, estimation error in μ.** It still relies on a 2-year window (`LOOKBACK_DIAS`), and it assumes a common mean within each class is a sensible target.
 - **One historical path.** The backtest covers a single three-year period, so a better estimator is not guaranteed to produce a better result in it.

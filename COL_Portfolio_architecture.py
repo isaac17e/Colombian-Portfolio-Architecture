@@ -178,6 +178,14 @@ ETFS_RF_GLOBALES: List[str] = ["TLT"]
 # representan comprar TES a ese plazo. Son replicables con TES reales.
 NODOS_TES: List[float] = [1.0, 3.0, 5.0, 10.0]
 
+# Activos que cotizan en dólares. El portafolio se mide en pesos, así que sus precios se
+# multiplican por el dólar (USD/COP) de cada día: así su retorno y su riesgo incluyen el
+# efecto del tipo de cambio, que es lo que siente un inversionista en pesos. Agrega aquí
+# cualquier otro ticker en dólares que incluyas en las secciones 4 y 5.
+CONVERTIR_USD_A_COP: bool = True
+ACTIVOS_EN_USD: List[str] = ETFS_RV_GLOBALES + ETFS_RF_GLOBALES
+TICKER_USDCOP: str = "COP=X"           # Yahoo Finance: pesos por dólar. Si no se descarga, los activos en USD quedan fuera.
+
 # ------------------------------------------------------------------------------
 # 6. UNIVERSO DE RENTA FIJA: BONOS INDIVIDUALES  (TÚ LOS LLENAS)
 # ------------------------------------------------------------------------------
@@ -224,9 +232,12 @@ NODOS_TES: List[float] = [1.0, 3.0, 5.0, 10.0]
 #
 # EJEMPLO. El primer bono es real en lo que se pudo verificar en fuentes del Ministerio
 # de Hacienda: TES en pesos emitido el 27-feb-2025 con vencimiento el 27-feb-2030 y
-# cupón de 12,50%. NO se pudo verificar su ISIN ni la tasa de hoy: el "isin" es un
-# marcador que debes reemplazar por el ISIN real, y la "ytm" (14,79%) es el corte de
-# la subasta de mayo de 2026, no la de tu fecha de datos. Actualiza ambos antes de usarlo.
+# cupón de 12,50%. NO se pudo verificar su ISIN: el "isin" es un marcador que debes
+# reemplazar por el ISIN real. Como es deuda soberana, su tasa de mercado es la de la
+# curva TES a su plazo: se ingresa con "spread_bp": 0 para que tome siempre la curva de
+# la fecha de los datos. Si prefieres la tasa exacta de tu proveedor, cambia "spread_bp"
+# por "ytm" (la de ESA fecha; una tasa vieja, como la de una subasta anterior, infla el
+# retorno esperado del bono y lo favorece en el optimizador).
 # La plantilla de abajo (comentada) sirve para agregar más bonos; los datos de ISIN,
 # cupón, vencimiento y tasa los consigues en el informe de la subasta de TES del
 # Ministerio de Hacienda, en la BVC o con tu comisionista (Precia / PiP).
@@ -237,7 +248,7 @@ BONOS_UNIVERSO: List[Dict[str, object]] = [
         "rating": "AAA",
         "cupon": 0.1250,
         "vencimiento": "2030-02-27",
-        "ytm": 0.1479,
+        "spread_bp": 0,
         "frecuencia": 1,
         "indexacion": "TF",
         "liquidez": 0.95,
@@ -636,6 +647,32 @@ class MarketDataPipeline:
         return prices
 
     # ------------------------------------------------------------------ #
+    def fetch_fx(self, ticker: str) -> Optional[pd.Series]:
+        """
+        Serie diaria del tipo de cambio (pesos por dólar). None si no se pudo
+        descargar y no se permiten datos sintéticos; con datos sintéticos
+        permitidos (modo demostración) genera una serie simulada.
+        """
+        series = None
+        if _YFINANCE_AVAILABLE:
+            try:
+                raw = yf.download(ticker, start=self.start, end=self.end + pd.Timedelta(days=1),
+                                  auto_adjust=True, progress=False, threads=False)
+                if raw is not None and not raw.empty:
+                    col = "Close" if "Close" in raw.columns else raw.columns[0]
+                    series = raw[col].dropna()
+                    if isinstance(series, pd.DataFrame):
+                        series = series.iloc[:, 0]
+            except Exception as exc:
+                logger.warning("yfinance falló para el tipo de cambio %s (%s).", ticker, exc)
+        if series is not None and not series.empty:
+            return series.loc[self.start:self.end]
+        if PERMITIR_DATOS_SINTETICOS:
+            logger.warning("Sin tipo de cambio real %s: se genera una serie sintética.", ticker)
+            return self._synthetic_price_series(ticker).loc[self.start:self.end]
+        return None
+
+    # ------------------------------------------------------------------ #
     def _synthetic_price_series(self, ticker: str) -> pd.Series:
         """
         Genera una serie de precios vía Movimiento Browniano Geométrico con un
@@ -656,8 +693,11 @@ class MarketDataPipeline:
         is_local_bond_proxy = tk in {"GXTESCOL.CL", "TESCOL.CL"}
         is_local_equity = tk.endswith(".CL")
         is_benchmark = tk in {"^GSPC", "SPY", "QQQ"}
+        is_fx = tk == TICKER_USDCOP.upper()
 
-        if is_global_bond_proxy:
+        if is_fx:
+            mu, sigma, s0, beta_mkt = 0.03, 0.12, 4000.0, -0.3
+        elif is_global_bond_proxy:
             mu, sigma, s0, beta_mkt = 0.03, 0.12, 100.0, -0.15
         elif is_local_bond_proxy:
             mu, sigma, s0, beta_mkt = 0.085, 0.07, 12000.0, 0.10
@@ -4194,8 +4234,27 @@ def main() -> None:
         universe.all_tickers + [universe.benchmark], start_date, end_date, seed=SEMILLA_ALEATORIA
     )
     prices = pipeline.fetch_prices()
-    returns = pipeline.compute_returns(prices)
     logger.info("Precios obtenidos: %d filas x %d activos.", *prices.shape)
+
+    # --- Activos en dólares: se pasan a pesos con el USD/COP de cada día ---
+    sin_cambio: Set[str] = set()
+    en_usd = [tk for tk in ACTIVOS_EN_USD if tk in prices.columns and tk not in pipeline.synthetic_tickers_]
+    if CONVERTIR_USD_A_COP and en_usd:
+        usdcop = pipeline.fetch_fx(TICKER_USDCOP)
+        if usdcop is None or usdcop.empty:
+            sin_cambio = set(en_usd)
+            alertas.append(
+                f"No se pudo descargar el tipo de cambio {TICKER_USDCOP}: los activos en dólares "
+                f"({', '.join(en_usd)}) quedan fuera del portafolio, porque sin el dólar su retorno y su "
+                "riesgo en pesos serían incorrectos."
+            )
+            logger.warning("Sin tipo de cambio: excluidos %s.", en_usd)
+        else:
+            fx = usdcop.reindex(prices.index.union(usdcop.index)).ffill().reindex(prices.index)
+            prices = prices.copy()
+            prices[en_usd] = prices[en_usd].mul(fx, axis=0)
+            logger.info("Activos en USD convertidos a pesos con %s: %s.", TICKER_USDCOP, ", ".join(en_usd))
+    returns = pipeline.compute_returns(prices)
 
     # --- Selección del universo (datos reales vs. modo demostración) ---
     # Sólo se decide aquí lo que no depende de la fecha: tener precio real. La
@@ -4224,6 +4283,8 @@ def main() -> None:
         rv_tickers, rf_etf_tickers = _reales(universe.rv_tickers), _reales(universe.rf_etf_tickers)
     else:
         rv_tickers, rf_etf_tickers = list(universe.rv_tickers), list(universe.rf_etf_tickers)
+    rv_tickers = [tk for tk in rv_tickers if tk not in sin_cambio]
+    rf_etf_tickers = [tk for tk in rf_etf_tickers if tk not in sin_cambio]
     tickers_mercado = rv_tickers + rf_etf_tickers
 
     # --- Frescura de los precios frente a la fecha de cierre ---
@@ -4242,7 +4303,8 @@ def main() -> None:
     # --- Registro de los activos sin precio real ---
     liquidez = pipeline.liquidity_report()
     descartados = sorted(set(universe.rv_tickers + universe.rf_etf_tickers) - set(tickers_mercado))
-    motivos_exclusion = {tk: "sin precio real observable (serie sintética)" for tk in descartados}
+    motivos_exclusion = {tk: ("sin tipo de cambio USD/COP" if tk in sin_cambio
+                              else "sin precio real observable (serie sintética)") for tk in descartados}
     if descartados:
         logger.warning("Excluidos del universo invertible: %s",
                        "; ".join(f"{tk} ({motivos_exclusion[tk]})" for tk in descartados))
@@ -4661,7 +4723,9 @@ def main() -> None:
         "Metodología y límites",
         "<p><b>Datos.</b> Precios de Yahoo Finance y curva cero cupón TES en pesos del Banco de la "
         "República (1, 5 y 10 años, completada con Nelson-Siegel). Los spreads de crédito de los bonos "
-        "se anclan a tu cotización en la fecha de los datos; hacia atrás son simulados.</p>"
+        "se anclan a tu cotización en la fecha de los datos; hacia atrás son simulados. Los activos "
+        "en dólares se convierten a pesos con el USD/COP diario, de modo que su retorno y riesgo incluyen "
+        "el efecto del tipo de cambio.</p>"
         f"<p><b>Estimación.</b> Ventana de {LOOKBACK_DIAS} días; covarianza con shrinkage Ledoit-Wolf; "
         "retorno esperado de acciones y ETFs con Bayes-Stein; el de la renta fija es analítico "
         "(YTM + roll-down).</p>"
