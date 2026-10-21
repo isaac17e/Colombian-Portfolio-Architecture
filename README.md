@@ -1,8 +1,8 @@
 # Colombian Portfolio Architecture
 
-A single Python script, [`COL_Portfolio_architecture.py`](COL_Portfolio_architecture.py), that runs a **multi-asset allocation engine** for the Colombian market. It combines equities (BVC stocks and ETFs) and fixed income (TES curve nodes, bond ETFs and individual bonds) in one return/covariance matrix. It finds the maximum Sharpe portfolio with the latest available data, so it can be used to decide what to buy today. By default the optimizer is free (long-only, fully invested): the RV/RF split is a result, not an input. Strategic bands and weight caps are optional. An out-of-sample walk-forward backtest is available as a separate validation mode.
+A single Python script, [`COL_Portfolio_architecture.py`](COL_Portfolio_architecture.py), that runs a **multi-asset allocation engine** for the Colombian market. It combines equities (BVC stocks and ETFs) and fixed income (TES curve nodes, bond ETFs and individual bonds) in one return/covariance matrix. It finds the optimal portfolio with the latest available data, so it can be used to decide what to buy today. The criterion is selectable: maximum Sharpe, minimum variance, maximum return for a target volatility, minimum CVaR, or maximum return for a target CVaR. By default the optimizer is free (long-only, fully invested): the RV/RF split is a result, not an input. Strategic bands and weight caps are optional. An out-of-sample walk-forward backtest is available as a separate validation mode.
 
-It prints tables to the console and writes an interactive Plotly report to `outputs/reporte_interactivo.html`, plus the recommended portfolio to `outputs/portafolio_recomendado.csv` (weights and, if a capital is set, amounts in COP).
+It prints tables to the console and writes an interactive Plotly report to `outputs/reporte_interactivo.html`. The report is short and visual: the recommended portfolio with its measures (expected return, volatility, Sharpe, CVaR, RV/RF split) and amounts in COP, the efficient frontier and the TES curve.
 
 > Code comments, console output and the HTML report are in Spanish.
 
@@ -89,8 +89,18 @@ Equity prices, bond-ETF prices and the modeled fixed-income series are aligned b
 ### 5. Per-asset risk metrics (`RiskMetrics`)
 For each asset: annualized volatility, annualized geometric return, beta against the S&P 500, maximum drawdown, Sharpe ratio and modified duration (fixed income).
 
-### 6. Optimal portfolio at the closing date (`PortfolioOptimizer`, `AllocationPolicy`)
-Maximum Sharpe, long-only and fully invested. **By default there are no other restrictions:** the optimizer picks the assets that give the best return per unit of risk, and the RV/RF split comes out of the result (the report shows it by class and sub-class, with amounts in COP if `CAPITAL_INVERSION_COP` is set). Without caps the optimum tends to concentrate in few assets, so the report also shows the number of assets and the effective number (1/HHI), and raises an alert when it is very concentrated. Optional constraints, off by default (section 8 of the configuration):
+### 6. Optimal portfolio at the closing date (`PortfolioOptimizer`, `ObjectiveSpec`, `AllocationPolicy`)
+**Criteria** (`CRITERIO_OPTIMIZACION`):
+- `max_sharpe`: best return per unit of volatility (convex-QP reformulation, below).
+- `min_varianza`: the least volatile portfolio.
+- `max_retorno_vol`: highest expected return with annual volatility at most `VOLATILIDAD_OBJETIVO_ANUAL` (a target variance, expressed as volatility).
+- `min_cvar`: lowest CVaR. A linear program (Rockafellar-Uryasev) over historical scenarios.
+- `max_retorno_cvar`: highest expected return with CVaR at most `CVAR_OBJETIVO_MENSUAL`. Same linear program.
+
+**CVaR scenarios.** Continuous daily (or weekly, `FRECUENCIA_RETORNOS_CVAR`) log returns of the estimation window are summed in rolling windows that cover the horizon (`HORIZONTE_DIAS`, 21 = one month) and, by default, re-centred on the expected return the optimizer uses (`CVAR_CENTRAR_EN_MU`), so the tail does not inherit past trends. The level is `CVAR_NIVEL` (95%). The scenarios overlap, so with a 2-year window there are only about 24 independent months: read the CVaR as an approximation.
+
+**Reachable range and interactive choice.** Before optimizing, the program shows a table of reference portfolios (minimum variance, minimum CVaR, maximum Sharpe, maximum return) with their measures; the minimum and the maximum-return rows delimit the reachable volatility and CVaR. In an interactive terminal it then asks for the criterion and the target (Enter keeps what is configured; `PREGUNTAR_ANTES_DE_OPTIMIZAR = False` disables the questions). A target left empty takes the middle of the range, and one outside the range is replaced by the closest feasible value, with a warning.
+Long-only and fully invested, for the criterion chosen in section 8 of the configuration (`CRITERIO_OPTIMIZACION`). **By default there are no other restrictions:** the optimizer picks the assets that best serve the criterion, and the RV/RF split comes out of the result (the report shows it by class and sub-class, with amounts in COP if `CAPITAL_INVERSION_COP` is set). Without caps the optimum tends to concentrate in few assets, so the report also shows the number of assets and the effective number (1/HHI), and raises an alert when it is very concentrated. Optional constraints, off by default (section 9 of the configuration):
 - **strategic bands per asset class** (`BANDAS_POR_CLASE`), e.g. RV 40%–60% and RF 40%–60%;
 - **a general weight cap per asset** (`MAX_PESO_POR_ACTIVO`) and **caps per instrument type** (`TOPES_POR_TIPO`: stock, equity ETF, TES node, bond ETF, individual bond).
 
@@ -101,20 +111,23 @@ Other details:
 - The Sharpe ratio is not concave in the weights, so the problem is **reformulated as a convex QP** (Cornuejols and Tütüncü, 2006): minimize u'Σu subject to (μ−rf)'u = c, with caps and bands (if any) scaled by Σu, and w = u/Σu. SciPy SLSQP then reaches the global optimum from a single starting point, the feasible portfolio with the highest excess return (found with `linprog`).
 - **When no feasible portfolio beats the risk-free rate** (it happens in 16 of the 39 optimizations of the default 2021–2024 run), the Sharpe-optimal portfolio does not exist, and the engine returns the **minimum-variance portfolio** inside the caps and bands (if any). If the solver fails, the last resort is the feasible point closest to equal weights.
 - Infeasible bands or caps are detected before calling the solver.
-- The efficient frontier plot uses `N_PORTAFOLIOS_FRONTERA` Monte Carlo portfolios drawn inside the active constraints.
+- The frontier plot traces the maximum return for each volatility level inside the active constraints, with the individual assets, the reference portfolios and the chosen one.
 
 ### 7. Walk-forward backtest (`WalkForwardBacktester`, `"validacion"` mode only)
-- Rebalances on the **last trading day of each month** (`FRECUENCIA_REBALANCEO`), using only the previous 252 trading days. The weights are applied to the following period, which avoids look-ahead bias.
+- Rebalances on the **last trading day of each month** (`FRECUENCIA_REBALANCEO`), using only the previous `LOOKBACK_DIAS` trading days (504, about 2 years). The weights are applied to the following period, which avoids look-ahead bias.
 - Each rebalance uses the tactical fixed-income μ and the risk-free rate read from the curve at that date.
 - Daily portfolio returns are aggregated from **simple returns**, then converted to log returns.
 - Reports total and annualized return, volatility, Sharpe ratio, maximum drawdown, number of rebalances, average weight per class, and, if bands are active, whether they were respected at every rebalance.
 
 ### 8. HTML report
-A single interactive page with:
-- **Alerts** at the top (stale data, demo mode, concentration, `FECHA_FIN` in the past).
-- **The optimal portfolio:** weights and amounts, distribution by class and sub-class, and a summary (expected return, volatility, Sharpe, number of assets, concentration).
-- **Charts:** the efficient frontier, the TES curve and its path per node, the bond-screening map. In validation mode also the allocation over time, the internal composition of the fixed-income leg (A/B/C), weights per asset and the equity curve.
-- **Tables:** fixed-income analytics, screening verdicts, per-asset risk metrics, and liquidity, coverage and freshness per ticker. In validation mode also backtest performance and eligibility per rebalance.
+A short page, with the central information first:
+- **Alerts** (stale data, demo mode, concentration, a target outside the reachable range, `FECHA_FIN` in the past).
+- **Measure cards:** expected return, volatility, Sharpe, CVaR and VaR at the horizon, RV/RF split, number of assets and the effective number, risk-free rate and capital.
+- **The recommended portfolio:** table with weights, contribution to risk and amounts in COP; a bar chart of weight against risk contribution; and a ring chart by class and sub-class.
+- **Reachable range** table and the **efficient frontier**.
+- **Fixed income:** the TES curve at the closing date and, if you entered bonds, their screening table.
+- **Validation mode only:** the equity curve, the RV/RF allocation over time and the out-of-sample performance.
+- **Collapsed:** assets that are not investable at the close, and methodology and limits.
 
 ---
 
@@ -136,7 +149,7 @@ python COL_Portfolio_architecture.py
 
 The report is written to `outputs/` next to the script. Set the `OUTPUT_DIR` environment variable to change the location.
 
-All settings live in the **CONFIGURACIÓN (set up)** block at the top of the script, in 13 numbered sections with a comment on each line:
+All settings live in the **CONFIGURACIÓN (set up)** block at the top of the script, in 14 numbered sections with a comment on each line:
 1. execution mode (`recomendacion` / `validacion`) and capital in COP;
 2. date window (`FECHA_FIN = None` means today);
 3. real-data policy and data-quality alerts;
@@ -144,12 +157,13 @@ All settings live in the **CONFIGURACIÓN (set up)** block at the top of the scr
 5. fixed-income ETFs and TES nodes;
 6. **individual bonds (`BONOS_UNIVERSO`)**, with a guide on which bonds to look for, the fields of each bond and the screening criteria;
 7. TES curve source, cache path and risk-free tenor;
-8. portfolio constraints (free by default: optional bands and weight caps);
-9. lookback, Ledoit-Wolf and the expected-return estimator;
-10. backtest frequency and frontier size;
-11. liquidity and coverage thresholds;
-12. simulation parameters and random seed;
-13. output location.
+8. **optimization criterion and targets** (Sharpe, variance, CVaR), CVaR level, horizon and return frequency, and whether to ask before optimizing;
+9. portfolio constraints (free by default: optional bands and weight caps);
+10. lookback (2 years), Ledoit-Wolf and the expected-return estimator;
+11. backtest frequency and frontier size;
+12. liquidity and coverage thresholds;
+13. simulation parameters and random seed;
+14. output location.
 
 **To invest today:** leave `FECHA_FIN = None`, `MODO_EJECUCION = "recomendacion"` and `PERMITIR_DATOS_SINTETICOS = False`, set your capital, and fill `BONOS_UNIVERSO` with the quotes of that day.
 
@@ -157,7 +171,7 @@ All settings live in the **CONFIGURACIÓN (set up)** block at the top of the scr
 
 - **Only three curve nodes are observed.** Banrep publishes the 1, 5 and 10-year rates; tenors outside that range (below 1 year, above 10) are Nelson-Siegel extrapolations.
 - **Credit-spread history is simulated.** Individual bonds follow the real TES curve and their spread is anchored to your quote at the closing date, but before that date it is a random-walk reconstruction (the daily spread volatility is `BONOS_VOL_SPREAD_BP_DIARIA`); there is no public source of historical prices per bond. A bond is also assumed to have existed throughout the window.
-- **Bayes-Stein reduces, but does not remove, estimation error in μ.** It still relies on a 252-day window, and it assumes a common mean within each class is a sensible target.
+- **Bayes-Stein reduces, but does not remove, estimation error in μ.** It still relies on a 2-year window (`LOOKBACK_DIAS`), and it assumes a common mean within each class is a sensible target.
 - **One historical path.** The backtest covers a single three-year period, so a better estimator is not guaranteed to produce a better result in it.
 - **Yahoo Finance data for BVC tickers** fills Colombian holidays with the previous close. Even liquid stocks show about 10% of days with zero return, which is why the illiquidity threshold is set at 25%.
 

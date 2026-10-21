@@ -8,9 +8,10 @@ from __future__ import annotations
 import logging
 import os
 import ssl
+import sys
 import warnings
 import zlib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
@@ -62,12 +63,13 @@ TRADING_DAYS: int = 252
 #   5. Universo de Renta Fija: ETFs y nodos TES
 #   6. Universo de Renta Fija: BONOS INDIVIDUALES (los llenas tú)
 #   7. Curva TES (tasa libre de riesgo y base de la renta fija)
-#   8. Restricciones del portafolio (libre por defecto)
-#   9. Estimación de retornos y riesgo
-#  10. Backtest (sólo modo "validacion")
-#  11. Liquidez y cobertura de precios
-#  12. Parámetros del modelo de simulación
-#  13. Salida
+#   8. Criterio de optimización y objetivos (Sharpe, varianza, CVaR)
+#   9. Restricciones del portafolio (libres por defecto)
+#  10. Estimación de retornos y riesgo
+#  11. Backtest (sólo modo "validacion")
+#  12. Liquidez y cobertura de precios
+#  13. Parámetros del modelo de simulación
+#  14. Salida
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
@@ -91,8 +93,9 @@ CAPITAL_INVERSION_COP: Optional[float] = 100_000_000.0
 # ESA fecha.
 FECHA_FIN: Optional[str] = None
 
-# Años de historia hacia atrás. Sólo se usa si FECHA_INICIO es None.
-HISTORIA_ANIOS: float = 4.0
+# Años de historia hacia atrás. Sólo se usa si FECHA_INICIO es None. Debe ser mayor
+# que la ventana de estimación (sección 10): lo que sobra es el periodo del backtest.
+HISTORIA_ANIOS: float = 5.0
 
 # Fecha de inicio fija ("2021-01-01"). None = FECHA_FIN menos HISTORIA_ANIOS.
 FECHA_INICIO: Optional[str] = None
@@ -278,7 +281,39 @@ RUTA_CURVA_TES_CSV: Optional[str] = None
 INCLUIR_ROLLDOWN: bool = True
 
 # ------------------------------------------------------------------------------
-# 8. RESTRICCIONES DEL PORTAFOLIO (LIBRE POR DEFECTO)
+# 8. CRITERIO DE OPTIMIZACIÓN Y OBJETIVOS
+# ------------------------------------------------------------------------------
+# Qué significa "mejor portafolio". Todos son long-only y 100% invertidos, y
+# respetan las restricciones de la sección 9 si las activas:
+#   "max_sharpe"        Mayor retorno por unidad de riesgo (volatilidad).
+#   "min_varianza"      El portafolio menos volátil posible.
+#   "max_retorno_vol"   El mayor retorno esperado sin pasar de una volatilidad anual
+#                       objetivo (equivale a fijar una varianza objetivo).
+#   "min_cvar"          La menor pérdida promedio en el peor (1 - CVAR_NIVEL) de los meses.
+#   "max_retorno_cvar"  El mayor retorno esperado sin que el CVaR mensual pase de un objetivo.
+CRITERIO_OPTIMIZACION: str = "max_sharpe"
+
+# Objetivos de riesgo (sólo se usan con el criterio que los necesita). None = el
+# programa muestra el rango alcanzable y toma el punto medio.
+VOLATILIDAD_OBJETIVO_ANUAL: Optional[float] = None   # p. ej. 0.08 = 8% anual
+CVAR_OBJETIVO_MENSUAL: Optional[float] = None        # p. ej. 0.04 = pérdida promedio de 4% en el peor 5% de los meses
+
+# Antes de optimizar, el programa muestra el rango alcanzable de volatilidad y
+# CVaR y te pregunta por el criterio y los objetivos (Enter = deja lo configurado
+# aquí). Sin terminal interactiva (cron, ejecución automática) no pregunta.
+PREGUNTAR_ANTES_DE_OPTIMIZAR: bool = True
+
+# --- CVaR (pérdida esperada en la cola) ---------------------------------------
+CVAR_NIVEL: float = 0.95               # 0.95 = promedio del peor 5% de los casos.
+HORIZONTE_DIAS: int = 21               # Horizonte del portafolio en días hábiles (21 ≈ 1 mes).
+FRECUENCIA_RETORNOS_CVAR: str = "diaria"  # Retornos continuos con que se arman los escenarios: "diaria" o "semanal".
+                                       # Con "semanal" hay menos escenarios (~100 en 2 años): la cola es poco confiable.
+CVAR_CENTRAR_EN_MU: bool = True        # True: los escenarios se recentran en el retorno esperado usado por el
+                                       # optimizador, para no heredar la tendencia pasada (p. ej. una acción que
+                                       # subió mucho). False: escenarios históricos tal cual.
+
+# ------------------------------------------------------------------------------
+# 9. RESTRICCIONES DEL PORTAFOLIO (LIBRES POR DEFECTO)
 # ------------------------------------------------------------------------------
 # Por defecto el optimizador decide libremente, sin ventas en corto y 100%
 # invertido: escoge los activos que mejor sirvan al criterio de optimización y la
@@ -304,23 +339,23 @@ TOPES_POR_TIPO: Dict[str, Optional[float]] = {
 }
 
 # Peso mínimo (%) para que un activo aparezca en las tablas de resultados.
-PESO_MIN_REPORTE_PCT: float = 0.01
+PESO_MIN_REPORTE_PCT: float = 0.5
 
 # ------------------------------------------------------------------------------
-# 9. ESTIMACIÓN DE RETORNOS Y RIESGO
+# 10. ESTIMACIÓN DE RETORNOS Y RIESGO
 # ------------------------------------------------------------------------------
-LOOKBACK_DIAS: int = 252              # Días hábiles de historia para estimar (252 ≈ 1 año).
+LOOKBACK_DIAS: int = 504              # Días hábiles de historia para estimar (504 ≈ 2 años).
 USAR_SHRINKAGE_LEDOIT_WOLF: bool = True  # Suaviza la matriz de covarianza (recomendado).
 ESTIMADOR_MU: str = "bayes_stein"     # Retorno esperado de acciones/ETFs: "bayes_stein" o "muestral".
 
 # ------------------------------------------------------------------------------
-# 10. BACKTEST (sólo en modo "validacion")
+# 11. BACKTEST (sólo en modo "validacion")
 # ------------------------------------------------------------------------------
 FRECUENCIA_REBALANCEO: str = "ME"     # "ME" = último día hábil de cada mes.
-N_PORTAFOLIOS_FRONTERA: int = 3000    # Portafolios aleatorios de la gráfica de frontera eficiente.
+PUNTOS_FRONTERA: int = 25             # Puntos con que se traza la frontera eficiente en el reporte.
 
 # ------------------------------------------------------------------------------
-# 11. LIQUIDEZ Y COBERTURA DE PRECIOS
+# 12. LIQUIDEZ Y COBERTURA DE PRECIOS
 # ------------------------------------------------------------------------------
 MAX_PCT_DIAS_SIN_MOVIMIENTO: float = 0.25   # Un activo con más de este % de días sin variación de precio es ilíquido.
 MAX_DIAS_PRECIO_CONGELADO: int = 30         # ...o con el precio igual más de estos días seguidos.
@@ -328,7 +363,7 @@ MAX_DIAS_RELLENO_PRECIO: int = 5            # Días máximos que se arrastra el 
 HOLGURA_COBERTURA_DIAS: int = 45            # Tolerancia para considerar que un activo "listó tarde".
 
 # ------------------------------------------------------------------------------
-# 12. PARÁMETROS DEL MODELO DE SIMULACIÓN
+# 13. PARÁMETROS DEL MODELO DE SIMULACIÓN
 # ------------------------------------------------------------------------------
 SEMILLA_ALEATORIA: int = 42
 
@@ -343,7 +378,7 @@ CURVA_SIM_REVERSION: float = 0.015
 CURVA_SIM_PISO: float = 0.005
 
 # ------------------------------------------------------------------------------
-# 13. SALIDA
+# 14. SALIDA
 # ------------------------------------------------------------------------------
 DIRECTORIO_SALIDA: str = os.environ.get(
     "OUTPUT_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "outputs")
@@ -2319,6 +2354,55 @@ class GroupConstraint:
             )
 
 
+CRITERIOS_OPTIMIZACION: Dict[str, str] = {
+    "max_sharpe": "Máximo Sharpe",
+    "min_varianza": "Mínima varianza",
+    "max_retorno_vol": "Máximo retorno con volatilidad objetivo",
+    "min_cvar": "Mínimo CVaR",
+    "max_retorno_cvar": "Máximo retorno con CVaR objetivo",
+}
+
+
+@dataclass
+class ObjectiveSpec:
+    """
+    Qué optimizar y con qué objetivos de riesgo. Los defaults provienen de la
+    sección 8 de la configuración. Un objetivo en None se reemplaza por el punto
+    medio del rango alcanzable en el momento de optimizar.
+    """
+
+    criterion: str = field(default_factory=lambda: CRITERIO_OPTIMIZACION)
+    vol_target: Optional[float] = field(default_factory=lambda: VOLATILIDAD_OBJETIVO_ANUAL)
+    cvar_target: Optional[float] = field(default_factory=lambda: CVAR_OBJETIVO_MENSUAL)
+    cvar_level: float = field(default_factory=lambda: CVAR_NIVEL)
+    horizon_days: int = field(default_factory=lambda: HORIZONTE_DIAS)
+    return_freq: str = field(default_factory=lambda: FRECUENCIA_RETORNOS_CVAR)
+    center_on_mu: bool = field(default_factory=lambda: CVAR_CENTRAR_EN_MU)
+
+    def __post_init__(self) -> None:
+        if self.criterion not in CRITERIOS_OPTIMIZACION:
+            raise ValueError(f"CRITERIO_OPTIMIZACION debe ser uno de {list(CRITERIOS_OPTIMIZACION)}, "
+                             f"no '{self.criterion}'.")
+        if not 0.5 <= self.cvar_level < 1.0:
+            raise ValueError(f"CVAR_NIVEL debe estar en [0.5, 1), no {self.cvar_level}.")
+        if self.return_freq not in ("diaria", "semanal"):
+            raise ValueError(f"FRECUENCIA_RETORNOS_CVAR debe ser 'diaria' o 'semanal', no '{self.return_freq}'.")
+        if self.horizon_days < 1:
+            raise ValueError("HORIZONTE_DIAS debe ser al menos 1.")
+
+    @property
+    def label(self) -> str:
+        return CRITERIOS_OPTIMIZACION[self.criterion]
+
+    @property
+    def needs_vol(self) -> bool:
+        return self.criterion == "max_retorno_vol"
+
+    @property
+    def needs_cvar(self) -> bool:
+        return self.criterion == "max_retorno_cvar"
+
+
 class PortfolioOptimizer:
     """
     Optimización de portafolios por Máximo Sharpe (Markowitz clásico) bajo
@@ -2545,36 +2629,6 @@ class PortfolioOptimizer:
             return w / w.sum()
         return None
 
-    def _random_feasible_weights(self, rng: np.random.Generator) -> np.ndarray:
-        """Peso aleatorio que respeta las bandas por clase y el tope por activo."""
-        # --- Sin bandas: Dirichlet con tope ---
-        if not self.group_constraints:
-            w = rng.dirichlet(np.ones(self.n))
-            w = np.minimum(w, self.max_weights)
-            return w / w.sum()
-
-        # --- Presupuesto aleatorio por grupo dentro de su banda ---
-        labels = [gc.label for gc in self.group_constraints]
-        lo = np.array([gc.min_weight for gc in self.group_constraints])
-        hi = np.array([gc.max_weight for gc in self.group_constraints])
-        budget = lo + rng.random(len(lo)) * (hi - lo)
-        budget = np.clip(budget / budget.sum(), lo, hi)
-        budget = budget / budget.sum()
-
-        # --- Reparto Dirichlet dentro de cada grupo ---
-        w = np.zeros(self.n)
-        for label, b in zip(labels, budget):
-            idx = self._group_index[label]
-            if len(idx) == 0:
-                continue
-            inner = rng.dirichlet(np.ones(len(idx)))
-            inner = np.minimum(inner * b, self.max_weights[idx])
-            if inner.sum() > 0:
-                inner = inner * (b / inner.sum())
-            w[idx] = np.minimum(inner, self.max_weights[idx])
-        total = w.sum()
-        return w / total if total > 0 else np.repeat(1.0 / self.n, self.n)
-
     # ------------------------------------------------------------------ #
     # a) MARKOWITZ / MÁXIMO SHARPE
     # ------------------------------------------------------------------ #
@@ -2669,7 +2723,237 @@ class PortfolioOptimizer:
         return self._minimize_quadratic(self.cov_, np.zeros(self.n), start=self._initial_weights())
 
     # ------------------------------------------------------------------ #
+    # ESCENARIOS Y CVaR (SIMULACIÓN HISTÓRICA)
+    # ------------------------------------------------------------------ #
+    def scenarios(self, spec: ObjectiveSpec) -> np.ndarray:
+        """
+        Matriz (escenarios x activos) de retornos simples al horizonte del
+        portafolio. Se arma con los retornos continuos de la ventana
+        (diarios o semanales) sumados en ventanas móviles que cubren el
+        horizonte; con `center_on_mu` se recentran en el retorno esperado del
+        optimizador para que el CVaR sea coherente con el μ que se está usando.
+        """
+        key = (spec.return_freq, spec.horizon_days, spec.center_on_mu)
+        if getattr(self, "_scenario_key", None) == key:
+            return self._scenario_cache
+
+        r = self.returns
+        periods_per_year = self.trading_days
+        if spec.return_freq == "semanal":
+            r = r.resample("W-FRI").sum()
+            periods_per_year = 52
+        k = max(int(round(spec.horizon_days * periods_per_year / self.trading_days)), 1)
+        horizon_log = r.rolling(k).sum().dropna().to_numpy()
+        if len(horizon_log) < 30:
+            raise ValueError(
+                f"Sólo {len(horizon_log)} escenarios para el CVaR (ventana demasiado corta para "
+                f"el horizonte); amplía LOOKBACK_DIAS o usa FRECUENCIA_RETORNOS_CVAR = 'diaria'."
+            )
+        if spec.center_on_mu:
+            horizon_log = horizon_log - horizon_log.mean(axis=0) + self.mu_ * (k / periods_per_year)
+        self._scenario_key, self._scenario_cache = key, np.expm1(horizon_log)
+        return self._scenario_cache
+
+    # ------------------------------------------------------------------ #
+    def cvar_var(self, w: np.ndarray, spec: ObjectiveSpec) -> Tuple[float, float]:
+        """(CVaR, VaR) de pérdida al horizonte, como fracción positiva del portafolio."""
+        losses = -(self.scenarios(spec) @ np.asarray(w, dtype=float))
+        var = float(np.quantile(losses, spec.cvar_level))
+        tail = losses[losses >= var]
+        return float(tail.mean()), var
+
+    # ------------------------------------------------------------------ #
+    def _lp_constraints(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        """Bandas por clase en forma A_ub·w ≤ b_ub (None si no hay bandas)."""
+        if not len(self._band_matrix):
+            return None, None
+        return (np.vstack([self._band_matrix, -self._band_matrix]),
+                np.concatenate([self._band_hi, -self._band_lo]))
+
+    # ------------------------------------------------------------------ #
+    def _cvar_lp(
+        self, spec: ObjectiveSpec, maximize_return: bool, cvar_cap: Optional[float] = None
+    ) -> Optional[np.ndarray]:
+        """
+        Programa lineal de Rockafellar-Uryasev sobre los escenarios históricos.
+        Variables x = [w (n), α (1), z (S)] con CVaR = α + Σz / ((1−β)·S):
+
+            min  CVaR                       (maximize_return = False)
+            max  μ'w  s.t.  CVaR ≤ cvar_cap (maximize_return = True)
+            s.t. z_s ≥ −R_s·w − α,  z ≥ 0,  Σw = 1, topes y bandas.
+        """
+        R = self.scenarios(spec)
+        S, n = R.shape
+        tail = 1.0 / ((1.0 - spec.cvar_level) * S)
+        cvar_row = np.concatenate([np.zeros(n), [1.0], np.full(S, tail)])
+
+        loss_rows = np.hstack([-R, -np.ones((S, 1)), -np.eye(S)])
+        a_ub, b_ub = [loss_rows], [np.zeros(S)]
+        band_a, band_b = self._lp_constraints()
+        if band_a is not None:
+            a_ub.append(np.hstack([band_a, np.zeros((len(band_a), 1 + S))]))
+            b_ub.append(band_b)
+        if maximize_return:
+            a_ub.append(cvar_row[None, :])
+            b_ub.append([cvar_cap])
+            cost = np.concatenate([-self.mu_, np.zeros(1 + S)])
+        else:
+            cost = cvar_row
+
+        res = optimize.linprog(
+            cost, A_ub=np.vstack(a_ub), b_ub=np.concatenate(b_ub),
+            A_eq=np.concatenate([np.ones(n), np.zeros(1 + S)])[None, :], b_eq=[1.0],
+            bounds=[(self.min_weight, float(m)) for m in self.max_weights] + [(None, None)] + [(0, None)] * S,
+            method="highs",
+        )
+        if not res.success:
+            return None
+        w = np.clip(res.x[:n], 0.0, None)
+        return w / w.sum() if w.sum() > 0 else None
+
+    # ------------------------------------------------------------------ #
+    def _max_return_weights(self) -> np.ndarray:
+        """Portafolio factible de mayor retorno esperado (LP): el extremo de mayor riesgo."""
+        band_a, band_b = self._lp_constraints()
+        lp = optimize.linprog(
+            -self.mu_, A_ub=band_a, b_ub=band_b,
+            A_eq=np.ones((1, self.n)), b_eq=[1.0],
+            bounds=np.column_stack([np.full(self.n, self.min_weight), self.max_weights]),
+        )
+        if lp.success:
+            return np.clip(lp.x, 0.0, None) / np.clip(lp.x, 0.0, None).sum()
+        return self._initial_weights()
+
+    # ------------------------------------------------------------------ #
+    def _max_return_vol_weights(self, vol_cap: float) -> Optional[np.ndarray]:
+        """Máximo retorno con volatilidad ≤ vol_cap: QP convexo, punto inicial = mínima varianza."""
+        start = self._min_variance_weights()
+        if start is None:
+            return None
+        constraints = [
+            optimize.LinearConstraint(np.ones((1, self.n)), 1.0, 1.0),
+            optimize.NonlinearConstraint(lambda w: w @ self.cov_ @ w, 0.0, vol_cap ** 2,
+                                         jac=lambda w: 2.0 * self.cov_ @ w),
+        ]
+        if len(self._band_matrix):
+            constraints.append(optimize.LinearConstraint(self._band_matrix, self._band_lo, self._band_hi))
+        res = optimize.minimize(
+            lambda w: -(w @ self.mu_), start, jac=lambda w: -self.mu_, method="SLSQP",
+            bounds=optimize.Bounds(self.min_weight, self.max_weights), constraints=constraints,
+            options={"maxiter": 1000, "ftol": 1e-12},
+        )
+        w = np.clip(res.x, 0.0, None)
+        if res.success and w.sum() > 0:
+            w = w / w.sum()
+            if self.is_feasible(w) and np.sqrt(w @ self.cov_ @ w) <= vol_cap * (1 + 1e-4):
+                return w
+        return start
+
+    # ------------------------------------------------------------------ #
+    # MEDIDAS DE UN PORTAFOLIO Y RANGO ALCANZABLE
+    # ------------------------------------------------------------------ #
+    def measures(self, w: Union[pd.Series, np.ndarray], spec: ObjectiveSpec) -> Dict[str, float]:
+        """Retorno, volatilidad, Sharpe, CVaR/VaR al horizonte y concentración de un portafolio."""
+        w = np.asarray(w, dtype=float)
+        ret, vol = self._portfolio_perf(w)
+        cvar, var = self.cvar_var(w, spec)
+        hhi = float((w ** 2).sum())
+        return {
+            "retorno_esperado_anual": float(np.expm1(ret)),
+            "volatilidad_anual": vol,
+            "sharpe": (ret - self.rf_log_) / vol if vol > 0 else 0.0,
+            "cvar_horizonte": cvar,
+            "var_horizonte": var,
+            "num_activos": float((w > 1e-4).sum()),
+            "activos_efectivos": 1.0 / hhi if hhi > 0 else 0.0,
+            "mayor_peso": float(w.max()),
+        }
+
+    # ------------------------------------------------------------------ #
+    def reference_portfolios(self, spec: ObjectiveSpec) -> Dict[str, np.ndarray]:
+        """Portafolios de referencia que delimitan lo alcanzable."""
+        w_minvar = self._min_variance_weights()
+        refs = {
+            "Mínima varianza": w_minvar if w_minvar is not None else self._initial_weights(),
+            "Mínimo CVaR": self._cvar_lp(spec, maximize_return=False),
+            "Máximo Sharpe": self.max_sharpe().to_numpy(),
+            "Máximo retorno": self._max_return_weights(),
+        }
+        return {k: v for k, v in refs.items() if v is not None}
+
+    # ------------------------------------------------------------------ #
+    def achievable_ranges(self, spec: ObjectiveSpec) -> Tuple[pd.DataFrame, Dict[str, Tuple[float, float]]]:
+        """
+        Tabla de los portafolios de referencia con sus medidas y rangos
+        alcanzables de volatilidad anual y CVaR al horizonte: del mínimo (el
+        portafolio que lo minimiza) al valor del portafolio de máximo retorno.
+        """
+        refs = self.reference_portfolios(spec)
+        self.reference_weights_ = refs
+        table = pd.DataFrame({name: self.measures(w, spec) for name, w in refs.items()}).T
+        ranges = {
+            "vol": (float(table.loc["Mínima varianza", "volatilidad_anual"]),
+                    float(table.loc["Máximo retorno", "volatilidad_anual"])),
+            "cvar": (float(table.loc["Mínimo CVaR", "cvar_horizonte"]),
+                     float(table.loc["Máximo retorno", "cvar_horizonte"])),
+        }
+        return table, ranges
+
+    # ------------------------------------------------------------------ #
+    def optimize(
+        self, spec: ObjectiveSpec, ranges: Optional[Dict[str, Tuple[float, float]]] = None
+    ) -> Tuple[pd.Series, Dict[str, object]]:
+        """
+        Resuelve el criterio pedido. Si un objetivo cae fuera del rango
+        alcanzable se usa el valor factible más cercano (y se informa); si no se
+        dio objetivo, el punto medio del rango. Retorna (pesos, info).
+        """
+        info: Dict[str, object] = {"criterio": spec.label, "nota": ""}
+        w: Optional[np.ndarray] = None
+
+        if spec.criterion == "max_sharpe":
+            w = self.max_sharpe().to_numpy()
+        elif spec.criterion == "min_varianza":
+            w = self._min_variance_weights()
+        elif spec.criterion == "min_cvar":
+            w = self._cvar_lp(spec, maximize_return=False)
+        else:
+            if ranges is None:
+                ranges = self.achievable_ranges(spec)[1]
+            key, target = ("vol", spec.vol_target) if spec.needs_vol else ("cvar", spec.cvar_target)
+            lo, hi = ranges[key]
+            used = (lo + hi) / 2.0 if target is None else float(np.clip(target, lo, hi))
+            unit = "volatilidad anual" if key == "vol" else "CVaR"
+            if target is None:
+                info["nota"] = f"Sin {unit} objetivo: se usó el punto medio del rango alcanzable ({used:.2%})."
+            elif abs(used - target) > 1e-9:
+                info["nota"] = (f"El objetivo de {unit} ({target:.2%}) está fuera del rango alcanzable "
+                                f"[{lo:.2%}, {hi:.2%}]: se usó {used:.2%}.")
+            info["objetivo_usado"] = used
+            if key == "vol":
+                w = self._max_return_vol_weights(used)
+            else:
+                w = self._cvar_lp(spec, maximize_return=True, cvar_cap=used * (1 + 1e-9))
+
+        if w is None:
+            logger.warning("%s: el solver no encontró solución; se usa la mínima varianza.", spec.label)
+            info["nota"] = (info["nota"] + " El solver no convergió: se usó la mínima varianza.").strip()
+            w = self._min_variance_weights()
+            if w is None:
+                w = self._initial_weights()
+        w = np.clip(w, 0.0, None) / np.clip(w, 0.0, None).sum()
+        return pd.Series(w, index=self.assets, name=spec.criterion), info
+
+    # ------------------------------------------------------------------ #
     # DIAGNÓSTICO DE LA SOLUCIÓN
+    # ------------------------------------------------------------------ #
+    def risk_contribution(self, weights: Union[pd.Series, np.ndarray]) -> pd.Series:
+        """Contribución porcentual de cada activo a la varianza del portafolio."""
+        w = np.asarray(weights, dtype=float)
+        marginal = self.cov_ @ w
+        total = float(w @ marginal)
+        return pd.Series(w * marginal / total if total > 0 else 0.0, index=self.assets)
+
     # ------------------------------------------------------------------ #
     def group_exposure(self, weights: Union[pd.Series, np.ndarray]) -> pd.Series:
         """Exposición agregada por grupo (clase de activo) de un vector de pesos."""
@@ -2694,51 +2978,72 @@ class PortfolioOptimizer:
     # VISUALIZACIONES
     # ------------------------------------------------------------------ #
     def plot_efficient_frontier(
-        self, n_portfolios: Optional[int] = None, seed: int = 7
+        self,
+        chosen: pd.Series,
+        chosen_label: str,
+        references: Optional[Mapping[str, np.ndarray]] = None,
+        n_points: Optional[int] = None,
     ) -> go.Figure:
         """
-        Simula portafolios aleatorios long-only (Monte Carlo) dentro de las
-        restricciones vigentes (bandas y topes, si los hay) para trazar la nube
-        de riesgo-retorno y la frontera eficiente, superponiendo el portafolio
-        de Máximo Sharpe.
+        Frontera eficiente (máximo retorno para cada nivel de volatilidad, con
+        las restricciones vigentes), los activos individuales, los portafolios
+        de referencia y el portafolio elegido.
         """
-        n_portfolios = N_PORTAFOLIOS_FRONTERA if n_portfolios is None else n_portfolios
-        # --- Simulación Monte Carlo de portafolios factibles ---
-        rng = np.random.default_rng(seed)
-        results = np.zeros((3, n_portfolios))
-        for i in range(n_portfolios):
-            w = self._random_feasible_weights(rng)
-            ret, vol = self._portfolio_perf(w)
-            sharpe = (ret - self.rf_log_) / vol if vol > 0 else 0.0
-            results[:, i] = [ret, vol, sharpe]
-
-        # --- Nube de portafolios simulados ---
+        n_points = PUNTOS_FRONTERA if n_points is None else n_points
         fig = go.Figure()
+
+        # --- Activos individuales ---
+        vols = np.sqrt(np.diag(self.cov_))
         fig.add_trace(go.Scatter(
-            x=results[1], y=results[0], mode="markers",
-            marker=dict(
-                size=5, color=results[2], colorscale="Viridis", opacity=0.5,
-                colorbar=dict(title="Sharpe"),
-            ),
-            name="Portafolios simulados (dentro de las restricciones)", hoverinfo="skip",
+            x=vols, y=np.expm1(self.mu_), mode="markers", name="Activos individuales",
+            marker=dict(size=6, color="lightgray", line=dict(width=0.5, color="gray")),
+            text=self.assets, hovertemplate="%{text}<br>vol %{x:.1%} | retorno %{y:.1%}<extra></extra>",
         ))
 
-        # --- Portafolio de Máximo Sharpe ---
-        w_opt = self.max_sharpe()
-        ret, vol = self._portfolio_perf(w_opt.values)
+        # --- Frontera: máximo retorno para volatilidades crecientes ---
+        w_minvar = self._min_variance_weights()
+        w_maxret = self._max_return_weights()
+        points: List[Tuple[float, float]] = []
+        if w_minvar is not None:
+            lo, hi = self._portfolio_perf(w_minvar)[1], self._portfolio_perf(w_maxret)[1]
+            for cap in np.linspace(lo, hi, n_points):
+                w = self._max_return_vol_weights(cap)
+                if w is not None:
+                    ret, vol = self._portfolio_perf(w)
+                    points.append((vol, np.expm1(ret)))
+            if points:
+                xs, ys = zip(*sorted(points))
+                fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Frontera eficiente",
+                                         line=dict(width=2.5, color="#2E6F9E")))
+
+        # --- Portafolios de referencia y elegido ---
+        for name, w in (references or {}).items():
+            ret, vol = self._portfolio_perf(np.asarray(w, dtype=float))
+            fig.add_trace(go.Scatter(
+                x=[vol], y=[np.expm1(ret)], mode="markers", name=name,
+                marker=dict(size=10, symbol="diamond", line=dict(width=1, color="white")),
+            ))
+        ret, vol = self._portfolio_perf(chosen.to_numpy())
         fig.add_trace(go.Scatter(
-            x=[vol], y=[ret], mode="markers", name="Máximo Sharpe",
-            marker=dict(symbol="star", size=18, color="red", line=dict(width=1, color="white")),
+            x=[vol], y=[np.expm1(ret)], mode="markers", name=f"Elegido: {chosen_label}",
+            marker=dict(symbol="star", size=20, color="red", line=dict(width=1, color="white")),
         ))
 
-        # --- Formato ---
         bands = " | ".join(
             f"{gc.label}: {gc.min_weight:.0%}–{gc.max_weight:.0%}" for gc in self.group_constraints
         )
+        # Vista inicial centrada en la zona útil; el resto de la frontera se ve con zoom.
+        near = [vol] + [self._portfolio_perf(np.asarray(w, dtype=float))[1]
+                        for name, w in (references or {}).items() if name != "Máximo retorno"]
+        x_max = 2.5 * max(near)
+        y_seen = ([y for x, y in points if x <= x_max] + [np.expm1(m) for v, m in zip(vols, self.mu_) if v <= x_max]
+                  + [np.expm1(ret)])
+        pad = 0.08 * (max(y_seen) - min(y_seen) or 0.05)
         fig.update_layout(
-            title=("Frontera Eficiente Multi-Activo — Simulación Monte Carlo"
-                   + (f"<br><sup>Bandas estratégicas: {bands}</sup>" if bands else "")),
-            xaxis_title="Volatilidad Anualizada", yaxis_title="Retorno Esperado Anualizado",
+            title="Frontera eficiente" + (f"<br><sup>Bandas: {bands}</sup>" if bands else ""),
+            xaxis_title="Volatilidad anual (zoom para ver el resto)", yaxis_title="Retorno esperado anual (E.A.)",
+            xaxis_tickformat=".0%", yaxis_tickformat=".0%",
+            xaxis_range=[0, x_max], yaxis_range=[min(y_seen) - pad, max(y_seen) + pad],
         )
         return fig
 
@@ -2798,8 +3103,10 @@ class WalkForwardBacktester:
         rf_fn: Optional[Callable[[pd.Timestamp], float]] = None,
         exclude_fn: Optional[Callable[[pd.Timestamp, pd.Timestamp], Set[str]]] = None,
         window_fn: Optional[Callable[[pd.Timestamp, pd.DataFrame], pd.DataFrame]] = None,
+        objective: Optional[ObjectiveSpec] = None,
     ) -> None:
         # --- Datos y parámetros del backtest ---
+        self.objective = objective or ObjectiveSpec()
         self.prices = prices.dropna(how="all")
         self.returns = MarketDataPipeline.compute_returns(self.prices)
         self.lookback_days = lookback_days
@@ -2883,7 +3190,8 @@ class WalkForwardBacktester:
     ) -> Tuple[pd.Series, float]:
         opt = self._build_optimizer(window_returns, reb_date)
         self.mu_shrinkage_history_[reb_date] = dict(opt.mu_shrinkage_)
-        return opt.max_sharpe(), opt.rf
+        weights, _ = opt.optimize(self.objective)
+        return weights, opt.rf
 
     # ------------------------------------------------------------------ #
     def _fallback_weights(self, window_returns: pd.DataFrame, reb_date: pd.Timestamp) -> pd.Series:
@@ -3023,7 +3331,7 @@ class WalkForwardBacktester:
         ))
         fig.add_hline(y=1.0, line=dict(color="gray", dash="dash", width=1))
         fig.update_layout(
-            title="Curva de Equity — Backtest Walk-Forward Multi-Activo (Máximo Sharpe)",
+            title=f"Curva de Equity — Backtest Walk-Forward ({self.objective.label})",
             xaxis_title="Fecha", yaxis_title="Valor del Portafolio (base = 1.0)",
         )
         return fig
@@ -3266,6 +3574,11 @@ class InteractiveReport:
     td:first-child,th:first-child{text-align:left;}
     tr:nth-child(even) td{background:#fbfbfc;}
     .wrap{overflow-x:auto;}
+    .kpis{display:flex;flex-wrap:wrap;gap:12px;margin:20px 0 8px;}
+    .kpi{background:#fff;border:1px solid #e3e3e3;border-radius:8px;padding:12px 18px;min-width:150px;}
+    .kpi .v{font-size:22px;font-weight:600;} .kpi .l{font-size:12px;color:#666;margin-top:2px;}
+    details{margin-top:28px;background:#fff;border:1px solid #e3e3e3;border-radius:8px;padding:8px 16px;}
+    summary{cursor:pointer;font-weight:600;padding:6px 0;}
     """
 
     def __init__(self, title: str, subtitle: str) -> None:
@@ -3290,6 +3603,27 @@ class InteractiveReport:
         html = df.to_html(float_format=lambda v: float_format.format(v), border=0, na_rep="—")
         self._blocks.append(f"<section><h2>{title}</h2><div class='wrap'>{html}</div></section>")
         return self
+
+    # ------------------------------------------------------------------ #
+    def add_kpis(self, items: Sequence[Tuple[str, str]]) -> "InteractiveReport":
+        """Tarjetas con las cifras clave (etiqueta, valor ya formateado)."""
+        cards = "".join(f"<div class='kpi'><div class='v'>{v}</div><div class='l'>{label}</div></div>"
+                        for label, v in items)
+        self._blocks.append(f"<div class='kpis'>{cards}</div>")
+        return self
+
+    # ------------------------------------------------------------------ #
+    def add_details(self, title: str, html: str) -> "InteractiveReport":
+        """Bloque plegado (se abre con un clic) para el detalle que no es central."""
+        self._blocks.append(f"<details><summary>{title}</summary>{html}</details>")
+        return self
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def table_html(df: pd.DataFrame, float_format: str = "{:.4f}") -> str:
+        return ("<div class='wrap'>"
+                + df.to_html(float_format=lambda v: float_format.format(v), border=0, na_rep="—")
+                + "</div>")
 
     # ------------------------------------------------------------------ #
     def add_note(self, text: str) -> "InteractiveReport":
@@ -3392,6 +3726,105 @@ def _descripcion_activo(spec: AssetSpec) -> str:
     if spec.sub_class is AssetSubClass.RF_BONO:
         return f"{spec.name} — ISIN {spec.metadata['isin']}, vence {spec.metadata['vencimiento']}"
     return spec.name
+
+
+def _formatear_medidas(tabla: pd.DataFrame) -> pd.DataFrame:
+    """Medidas de uno o varios portafolios en formato legible (porcentajes)."""
+    pct = "{:.2%}".format
+    out = pd.DataFrame(index=tabla.index)
+    out["retorno_esperado_E.A."] = tabla["retorno_esperado_anual"].map(pct)
+    out["volatilidad_anual"] = tabla["volatilidad_anual"].map(pct)
+    out["sharpe"] = tabla["sharpe"].map("{:.2f}".format)
+    out["CVaR_horizonte"] = tabla["cvar_horizonte"].map(pct)
+    out["VaR_horizonte"] = tabla["var_horizonte"].map(pct)
+    out["activos"] = tabla["num_activos"].astype(int)
+    out["activos_efectivos"] = tabla["activos_efectivos"].map("{:.1f}".format)
+    out["mayor_peso"] = tabla["mayor_peso"].map(pct)
+    return out
+
+
+def _pedir_porcentaje(mensaje: str, minimo: float, maximo: float, defecto: Optional[float]) -> Optional[float]:
+    """Pide un porcentaje por consola (escrito como 8 u 8%) dentro de [minimo, maximo]; Enter = defecto."""
+    while True:
+        texto = input(mensaje).strip().replace("%", "").replace(",", ".")
+        if not texto:
+            return defecto
+        try:
+            valor = float(texto) / 100.0
+        except ValueError:
+            print("  Escribe un número, por ejemplo 8 o 8%.")
+            continue
+        if minimo - 1e-9 <= valor <= maximo + 1e-9:
+            return valor
+        print(f"  Fuera del rango alcanzable [{minimo:.2%}, {maximo:.2%}]. Intenta de nuevo.")
+
+
+def _elegir_objetivo(spec: ObjectiveSpec, rangos: Dict[str, Tuple[float, float]]) -> ObjectiveSpec:
+    """
+    Pregunta por consola el criterio y el objetivo de riesgo (Enter conserva lo
+    configurado). No pregunta si PREGUNTAR_ANTES_DE_OPTIMIZAR es False o si no
+    hay terminal interactiva.
+    """
+    if not (PREGUNTAR_ANTES_DE_OPTIMIZAR and sys.stdin is not None and sys.stdin.isatty()):
+        return spec
+
+    claves = list(CRITERIOS_OPTIMIZACION)
+    print("\nCriterios de optimización:")
+    for i, clave in enumerate(claves, 1):
+        print(f"  {i}. {CRITERIOS_OPTIMIZACION[clave]}" + ("   <- configurado" if clave == spec.criterion else ""))
+    while True:
+        texto = input(f"Criterio [1-{len(claves)}] (Enter = conservar): ").strip()
+        if not texto:
+            break
+        if texto.isdigit() and 1 <= int(texto) <= len(claves):
+            spec = replace(spec, criterion=claves[int(texto) - 1])
+            break
+        print("  Opción no válida.")
+
+    if spec.needs_vol:
+        lo, hi = rangos["vol"]
+        medio = (lo + hi) / 2.0
+        defecto = spec.vol_target if spec.vol_target is not None else medio
+        valor = _pedir_porcentaje(
+            f"Volatilidad anual objetivo en % [{lo:.2%} a {hi:.2%}] (Enter = {defecto:.2%}): ", lo, hi, defecto)
+        spec = replace(spec, vol_target=valor)
+    elif spec.needs_cvar:
+        lo, hi = rangos["cvar"]
+        medio = (lo + hi) / 2.0
+        defecto = spec.cvar_target if spec.cvar_target is not None else medio
+        valor = _pedir_porcentaje(
+            f"CVaR {spec.cvar_level:.0%} a {spec.horizon_days} días objetivo en % [{lo:.2%} a {hi:.2%}] "
+            f"(Enter = {defecto:.2%}): ", lo, hi, defecto)
+        spec = replace(spec, cvar_target=valor)
+    return spec
+
+
+def _fig_pesos_riesgo(tabla: pd.DataFrame) -> go.Figure:
+    """Barras horizontales: peso de cada activo frente a su contribución al riesgo."""
+    t = tabla.sort_values("peso_%")
+    fig = go.Figure()
+    fig.add_trace(go.Bar(y=t.index, x=t["peso_%"], orientation="h", name="Peso (%)",
+                         marker_color="#2E6F9E"))
+    fig.add_trace(go.Bar(y=t.index, x=t["contribucion_riesgo_%"], orientation="h",
+                         name="Contribución a la varianza (%)", marker_color="#C77B30"))
+    fig.update_layout(barmode="group", xaxis_title="%", height=max(340, 46 * len(t)),
+                      legend=dict(orientation="h", y=1.08))
+    return fig
+
+
+def _fig_distribucion(dist_subclase: pd.DataFrame) -> go.Figure:
+    """Anillo RV/RF con su desglose por sub-clase."""
+    sub = dist_subclase["peso_%"][dist_subclase["peso_%"] > 0.05]
+    clase_de = {nombre: nombre.split(" — ")[0] for nombre in sub.index}
+    por_clase = sub.groupby(pd.Series(clase_de)).sum()
+    fig = go.Figure(go.Sunburst(
+        labels=list(por_clase.index) + list(sub.index),
+        parents=[""] * len(por_clase) + [clase_de[n] for n in sub.index],
+        values=list(por_clase.values) + list(sub.values),
+        branchvalues="total", texttemplate="%{label}<br>%{value:.1f}%",
+    ))
+    fig.update_layout(height=420, margin=dict(t=20, b=20))
+    return fig
 
 
 def main() -> None:
@@ -3597,7 +4030,7 @@ def main() -> None:
     # 6) PORTAFOLIO ÓPTIMO A LA FECHA DE CIERRE
     # ---------------------------------------------------------------- #
     logger.info("-" * 78)
-    logger.info("OPTIMIZACIÓN MULTI-ACTIVO — MÁXIMO SHARPE (%s)", policy.describe())
+    logger.info("OPTIMIZACIÓN MULTI-ACTIVO (%s)", policy.describe())
     policy.validate(specs)
 
     # --- μ analítico de la RF al cierre ---
@@ -3623,7 +4056,6 @@ def main() -> None:
         multi_returns.drop(columns=sorted(no_invertibles_cierre & set(multi_returns.columns))),
     )
 
-    # --- Optimización de Máximo Sharpe ---
     optimizer = PortfolioOptimizer(
         retornos_estrategicos,
         rf=rf_tes,
@@ -3633,18 +4065,33 @@ def main() -> None:
         group_constraints=policy.group_constraints(),
         expected_returns=mu_rf_hoy,
     )
-    weights_opt = optimizer.max_sharpe()
-    ret_opt, vol_opt = optimizer._portfolio_perf(weights_opt.values)
+
+    # --- Rango alcanzable y elección del criterio y los objetivos ---
+    objetivo = ObjectiveSpec()
+    tabla_rango, rangos = optimizer.achievable_ranges(objetivo)
+    print(f"\n--- Rango alcanzable con los datos al {fecha_cierre.date()} "
+          f"(CVaR {objetivo.cvar_level:.0%} a {objetivo.horizon_days} días) ---")
+    print(_formatear_medidas(tabla_rango).to_string())
+    objetivo = _elegir_objetivo(objetivo, rangos)
+    logger.info("Criterio de optimización: %s", objetivo.label)
+
+    weights_opt, info_opt = optimizer.optimize(objetivo, rangos)
+    if info_opt["nota"]:
+        logger.warning(info_opt["nota"])
+        alertas.append(str(info_opt["nota"]))
+    medidas = optimizer.measures(weights_opt, objetivo)
+    riesgo_contrib = optimizer.risk_contribution(weights_opt)
 
     # --- Tabla de pesos (con montos si hay capital) ---
     tabla_pesos = pd.DataFrame({
         "activo": [_descripcion_activo(specs[t]) for t in weights_opt.index],
         "clase": [specs[t].asset_class.value for t in weights_opt.index],
         "sub_clase": [specs[t].sub_class.value for t in weights_opt.index],
-        "peso_%": (weights_opt * 100).round(2),
+        "peso_%": weights_opt * 100,
+        "contribucion_riesgo_%": riesgo_contrib * 100,
     }, index=weights_opt.index)
     if CAPITAL_INVERSION_COP:
-        tabla_pesos["monto_COP"] = (weights_opt * CAPITAL_INVERSION_COP).round(0)
+        tabla_pesos["monto_COP"] = weights_opt * CAPITAL_INVERSION_COP
     tabla_pesos = tabla_pesos.sort_values("peso_%", ascending=False)
     tabla_pesos_visible = tabla_pesos[tabla_pesos["peso_%"] > PESO_MIN_REPORTE_PCT]
 
@@ -3652,45 +4099,34 @@ def main() -> None:
     def _distribucion(grupos: Mapping[str, str]) -> pd.DataFrame:
         dist = (weights_opt.groupby(pd.Series(grupos)).sum() * 100).rename("peso_%").to_frame()
         if CAPITAL_INVERSION_COP:
-            dist["monto_COP"] = (dist["peso_%"] / 100 * CAPITAL_INVERSION_COP).round(0)
+            dist["monto_COP"] = dist["peso_%"] / 100 * CAPITAL_INVERSION_COP
         return dist.sort_values("peso_%", ascending=False)
 
     dist_clase = _distribucion({t: specs[t].asset_class.value for t in weights_opt.index})
     dist_subclase = _distribucion({t: specs[t].sub_class.value for t in weights_opt.index})
+    peso_rv = float(dist_clase["peso_%"].get(AssetClass.RENTA_VARIABLE.value, 0.0))
+    peso_rf = float(dist_clase["peso_%"].get(AssetClass.RENTA_FIJA.value, 0.0))
 
-    # --- Concentración y resumen del portafolio ---
-    hhi = float((weights_opt ** 2).sum())
-    n_activos = int((weights_opt > 1e-4).sum())
-    resumen = pd.Series({
-        "retorno_esperado_anual_%": float(np.expm1(ret_opt) * 100),
-        "volatilidad_anual_%": float(vol_opt * 100),
-        "sharpe_esperado": float((ret_opt - optimizer.rf_log_) / vol_opt),
-        "tasa_libre_de_riesgo_%": float(rf_tes * 100),
-        "numero_de_activos": n_activos,
-        "activos_efectivos_(1/HHI)": 1.0 / hhi,
-        "mayor_peso_%": float(weights_opt.max() * 100),
-    }, name="valor")
+    n_activos = int(medidas["num_activos"])
     if not policy.bandas and policy.max_peso_activo is None and not any(policy.topes_por_tipo.values()):
-        if n_activos < 4 or weights_opt.max() > 0.5:
+        if n_activos < 4 or medidas["mayor_peso"] > 0.5:
             alertas.append(
                 f"Sin bandas ni topes el portafolio quedó concentrado ({n_activos} activos; "
-                f"mayor peso {weights_opt.max():.0%} en {weights_opt.idxmax()}). Si quieres más "
-                "diversificación, activa topes o bandas en la sección 8 de la configuración."
+                f"mayor peso {medidas['mayor_peso']:.0%} en {weights_opt.idxmax()}). Si quieres más "
+                "diversificación, activa topes o bandas en la sección 9 de la configuración."
             )
 
-    print(f"\n--- Portafolio óptimo al {fecha_cierre.date()} ---")
-    print(tabla_pesos_visible.to_string())
+    print(f"\n--- Portafolio óptimo al {fecha_cierre.date()} — {objetivo.label} ---")
+    print(tabla_pesos_visible.round(2).to_string())
     print("\n--- Distribución por clase de activo (resultado del optimizador) ---")
     print(dist_clase.round(2).to_string())
-    print("\n--- Distribución por sub-clase ---")
-    print(dist_subclase.round(2).to_string())
+    print("\n--- Medidas del portafolio ---")
+    print(_formatear_medidas(pd.DataFrame({"Elegido": medidas}).T).to_string())
     if policy.bandas:
         print("\n--- Cumplimiento de bandas ---")
         print(optimizer.constraints_check(weights_opt).to_string())
-    print("\n--- Resumen del portafolio ---")
-    print(resumen.round(4).to_string())
 
-    # --- Diagnóstico de shrinkage y métricas del óptimo ---
+    # --- Diagnóstico de shrinkage ---
     logger.info(
         "Intensidad de shrinkage Ledoit-Wolf: δ = %.4f (0 = covarianza muestral pura, 1 = target)",
         optimizer.shrinkage_intensity_,
@@ -3698,27 +4134,20 @@ def main() -> None:
     for clase, phi in optimizer.mu_shrinkage_.items():
         logger.info("Bayes-Stein sobre μ de %s: φ = %.3f (0 = media muestral, 1 = media común).",
                     clase, phi)
-    logger.info(
-        "Óptimo — retorno esp.: %.2f%% | vol: %.2f%% | Sharpe: %.4f | activos con peso > 0: %d",
-        ret_opt * 100, vol_opt * 100, (ret_opt - optimizer.rf_log_) / vol_opt, n_activos,
-    )
 
     # --- Calidad y frescura de los datos al cierre ---
     estado_cierre = {tk: motivos_cierre.get(tk, "elegible") for tk in tickers_mercado}
     estado_cierre.update({tk: motivos_exclusion[tk] for tk in descartados})
-    if not liquidez.empty:
-        tabla_liquidez = liquidez.assign(
-            primer_dato=liquidez["primer_dato"].dt.date,
-            ultimo_dato=liquidez["ultimo_dato"].dt.date,
-            dias_de_rezago=(fecha_cierre - liquidez["ultimo_dato"]).dt.days,
-            estado_al_cierre=[estado_cierre.get(tk, "—") for tk in liquidez.index],
-        ).sort_values("pct_sin_movimiento", ascending=False)
-    else:
-        tabla_liquidez = pd.DataFrame()
-
-    # Salida: copia del portafolio recomendado para abrir en Excel
-    ruta_csv = os.path.join(DIRECTORIO_SALIDA, "portafolio_recomendado.csv")
-    tabla_pesos_visible.to_csv(ruta_csv, index_label="ticker", encoding="utf-8-sig")
+    filas_calidad = {}
+    for tk, estado in estado_cierre.items():
+        if estado == "elegible":
+            continue
+        fila = {"estado_al_cierre": estado, "ultimo_dato": "—", "dias_de_rezago": np.nan}
+        if tk in liquidez.index:
+            fila["ultimo_dato"] = liquidez.loc[tk, "ultimo_dato"].date()
+            fila["dias_de_rezago"] = float((fecha_cierre - liquidez.loc[tk, "ultimo_dato"]).days)
+        filas_calidad[tk] = fila
+    tabla_excluidos = pd.DataFrame.from_dict(filas_calidad, orient="index")
 
     # ---------------------------------------------------------------- #
     # 7) BACKTEST WALK-FORWARD (sólo en modo "validacion")
@@ -3726,14 +4155,11 @@ def main() -> None:
     backtester = None
     if modo_validacion:
         logger.info("-" * 78)
-        logger.info("BACKTEST WALK-FORWARD FUERA DE MUESTRA")
+        logger.info("BACKTEST WALK-FORWARD FUERA DE MUESTRA — %s", objetivo.label)
 
         # --- Universo invertible en cada rebalanceo (sólo datos de la ventana) ---
-        motivos_por_fecha: Dict[pd.Timestamp, Dict[str, str]] = {}
-
         def no_invertibles(fecha: pd.Timestamp, inicio_ventana: pd.Timestamp) -> Set[str]:
             motivos = pipeline.tradability_issues_at(fecha, inicio_ventana, tickers_mercado)
-            motivos_por_fecha[pd.Timestamp(fecha)] = motivos
             return set(motivos) | fi_engine.excluded_bonds_at(fecha)
 
         # --- Configuración y ejecución del backtest ---
@@ -3750,189 +4176,124 @@ def main() -> None:
             rf_fn=lambda d: fi_engine.risk_free_at(d, policy.rf_tenor_years),
             exclude_fn=no_invertibles,
             window_fn=fi_engine.proforma_log_returns,
+            objective=objetivo,
         )
-        weights_history = backtester.run()
+        backtester.run()
         perf_summary = backtester.performance_summary()
-
-        # --- Elegibilidad por activo a lo largo del backtest ---
-        def _tabla_elegibilidad(tickers: Sequence[str]) -> pd.DataFrame:
-            elegibles = pd.DataFrame({
-                d: {tk: tk not in excl for tk in tickers} for d, excl in backtester.excluded_history_.items()
-            }).T
-            fechas_elegible = {tk: elegibles.index[elegibles[tk]] for tk in tickers}
-            return pd.DataFrame({
-                "rebalanceos_elegible": {tk: f"{int(elegibles[tk].sum())}/{len(elegibles)}" for tk in tickers},
-                "primer_rebalanceo": {tk: (f[0].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
-                "ultimo_rebalanceo": {tk: (f[-1].date() if len(f) else "—") for tk, f in fechas_elegible.items()},
-                "peso_medio_%_cuando_elegible": {
-                    tk: (float(weights_history.loc[f, tk].mean() * 100) if len(f) and tk in weights_history else 0.0)
-                    for tk, f in fechas_elegible.items()
-                },
-            })
-
-        bonos_en_matriz = [tk for tk, sp in specs.items() if sp.sub_class is AssetSubClass.RF_BONO]
-        tabla_elegibilidad = pd.DataFrame()
-        if bonos_en_matriz:
-            tabla_elegibilidad = _tabla_elegibilidad(bonos_en_matriz)
-            tabla_elegibilidad.insert(0, "vencimiento", {tk: specs[tk].metadata["vencimiento"]
-                                                         for tk in bonos_en_matriz})
-
-        # --- Universo de mercado: motivo de exclusión más frecuente y al cierre ---
-        def _categoria(motivo: str) -> str:
-            return motivo.split(":")[0].split(" desde")[0]
-
-        tabla_universo = _tabla_elegibilidad(tickers_mercado)
-        ultima_fecha = max(motivos_por_fecha)
-        tabla_universo["motivo_principal"] = {
-            tk: (pd.Series([_categoria(m[tk]) for m in motivos_por_fecha.values() if tk in m]).mode().iloc[0]
-                 if any(tk in m for m in motivos_por_fecha.values()) else "—")
-            for tk in tickers_mercado
-        }
-        tabla_universo["estado_ultimo_rebalanceo"] = {
-            tk: motivos_por_fecha[ultima_fecha].get(tk, "elegible") for tk in tickers_mercado
-        }
 
         # --- Salida en consola del backtest ---
         print("\n--- Asignación por clase de activo en cada rebalanceo (%) ---")
         print((backtester.class_weights_history_ * 100).round(2).to_string())
-        print("\n--- Composición interna de la Renta Fija (%) ---")
-        rf_subs = [s.value for s in (AssetSubClass.RF_NODO_TES, AssetSubClass.RF_ETF, AssetSubClass.RF_BONO)]
-        print((backtester.subclass_weights_history_[
-            [c for c in rf_subs if c in backtester.subclass_weights_history_.columns]
-        ] * 100).round(2).to_string())
         if policy.bandas:
             print("\n--- Cumplimiento de bandas a lo largo del backtest ---")
             print(backtester.band_compliance().to_string())
         print("\n--- Desempeño fuera de muestra ---")
         print(pd.Series(perf_summary, name="valor").round(4).to_string())
-        if not tabla_elegibilidad.empty:
-            print("\n--- Elegibilidad de bonos en el backtest (screening dinámico) ---")
-            print(tabla_elegibilidad.round(2).to_string())
-        print("\n--- Universo de mercado en el backtest (liquidez y cobertura en la ventana de cada rebalanceo) ---")
-        print(tabla_universo.round(2).to_string())
-
-        # --- Estado de elegibilidad en el backtest para la tabla de liquidez ---
-        if not tabla_liquidez.empty:
-            tabla_liquidez["elegibilidad_backtest"] = [
-                (f"elegible en {tabla_universo.loc[tk, 'rebalanceos_elegible']} rebalanceos"
-                 if tk in tabla_universo.index else "—")
-                for tk in tabla_liquidez.index
-            ]
 
     # ---------------------------------------------------------------- #
-    # 8) REPORTE HTML INTERACTIVO
+    # 8) REPORTE HTML INTERACTIVO (sólo lo relevante)
     # ---------------------------------------------------------------- #
-
-    # --- Cabecera y notas metodológicas ---
     report = InteractiveReport(
-        "Quant PM — Motor de Asset Allocation Multi-Activo (RV + RF)",
-        f"Datos al {fecha_cierre.date()} | Modo: {MODO_EJECUCION} | Universo: {n_rv} activos de "
-        f"Renta Variable y {n_rf} de Renta Fija | Rango: {start_date} a {end_date} | "
-        f"Restricciones: {policy.describe()}",
+        "Portafolio óptimo — Mercado colombiano",
+        f"Datos al {fecha_cierre.date()} | Modo: {MODO_EJECUCION} | Criterio: {objetivo.label} | "
+        f"Universo: {n_rv} activos de Renta Variable y {n_rf} de Renta Fija | "
+        f"Ventana de estimación: {LOOKBACK_DIAS} días | Restricciones: {policy.describe()}",
     )
     for alerta in alertas:
         report.add_note(f"<b>⚠ Alerta.</b> {alerta}")
-    n_nodos = sum(1 for sp in specs.values() if sp.sub_class is AssetSubClass.RF_NODO_TES)
-    n_bonos = sum(1 for sp in specs.values() if sp.sub_class is AssetSubClass.RF_BONO)
-    nota_b = (f"<b>(B)</b> {len(rf_etf_tickers)} ETF/FIC con precio líquido de mercado"
-              if rf_etf_tickers else
-              "<b>(B)</b> sin ETFs/FICs en esta corrida — ningún vehículo del universo tiene "
-              "precio observable en la fuente de datos")
-    nota_c = (f"<b>(C)</b> {n_bonos} bonos individuales que ingresaste y superan el filtro de rating, "
-              "plazo, liquidez y spread"
-              if n_bonos else
-              "<b>(C)</b> sin bonos individuales: BONOS_UNIVERSO está vacío o ninguno es candidato")
-    report.add_note(
-        "<b>Curva TES.</b> "
-        + ("Histórico diario real de las tasas cero cupón TES en pesos a 1, 5 y 10 años del Banco "
-           "de la República (SUAMECA), completado a todos los plazos con Nelson-Siegel "
-           f"(τ = {CURVA_TES_TAU_NS:g} años). Los spreads de crédito de los bonos se anclan a la "
-           "cotización que ingresaste en la fecha de los datos; hacia atrás son simulados, porque "
-           "no hay una fuente pública de precios históricos por título."
-           if fi_engine.shocks.source_ == "histórica" else
-           "<b>Simulada</b> alrededor de una curva fija de configuración: los resultados de renta "
-           "fija no reflejan episodios reales del mercado.")
-    )
-    report.add_note(
-        "<b>Arquitectura de Renta Fija.</b> La pata de RF combina tres vías: "
-        f"<b>(A)</b> {n_nodos} nodos sintéticos de la curva TES, cuyo retorno diario se modela por "
-        "duración modificada y convexidad — ΔP/P ≈ −D·Δy + ½·C·(Δy)²; "
-        f"{nota_b}; y {nota_c}. El μ de (A) y (C) es analítico (YTM + roll-down), no una media "
-        "muestral. Los bonos envejecen: el screening se repite en cada fecha de decisión y su "
-        "covarianza se estima con retornos pro-forma que aplican los choques históricos a su "
-        "duración actual."
-    )
-    report.add_note(
-        "<b>Integridad de datos.</b> "
-        + ("Se excluyeron del universo los activos sin precio real: "
-           + "; ".join(f"<b>{tk}</b>" for tk in descartados) + ". " if descartados else "")
-        + "La historia, la cotización reciente y la liquidez se evalúan sólo con los precios de la "
-        f"ventana de estimación ({LOOKBACK_DIAS} días). El motor no sustituye precios faltantes por "
-        "series simuladas dentro del optimizador, ni admite títulos cuyo precio congelado haría "
-        "parecer su riesgo menor al real."
-    )
 
-    # --- Sección: portafolio óptimo ---
-    cap_txt = (f" — capital {CAPITAL_INVERSION_COP:,.0f} COP" if CAPITAL_INVERSION_COP else "")
-    report.add_table(f"Portafolio óptimo al {fecha_cierre.date()} (peso > {PESO_MIN_REPORTE_PCT:g}%){cap_txt}",
-                     tabla_pesos_visible, "{:,.2f}")
-    report.add_table("Distribución por clase de activo (RV vs RF, resultado del optimizador)",
-                     dist_clase, "{:,.2f}")
-    report.add_table("Distribución por sub-clase", dist_subclase, "{:,.2f}")
-    report.add_table("Resumen del portafolio", resumen.to_frame(), "{:,.4f}")
-    if policy.bandas:
-        report.add_table("Cumplimiento de bandas — portafolio óptimo",
-                         optimizer.constraints_check(weights_opt), "{:.4f}")
-    report.add_chart("Frontera Eficiente Multi-Activo", optimizer.plot_efficient_frontier())
+    # --- Medidas clave ---
+    capital_txt = f"{CAPITAL_INVERSION_COP / 1e6:,.0f} M COP" if CAPITAL_INVERSION_COP else "—"
+    report.add_kpis([
+        ("Retorno esperado (E.A.)", f"{medidas['retorno_esperado_anual']:.1%}"),
+        ("Volatilidad anual", f"{medidas['volatilidad_anual']:.1%}"),
+        ("Sharpe esperado", f"{medidas['sharpe']:.2f}"),
+        (f"CVaR {objetivo.cvar_level:.0%} a {objetivo.horizon_days} días", f"{medidas['cvar_horizonte']:.1%}"),
+        (f"VaR {objetivo.cvar_level:.0%} a {objetivo.horizon_days} días", f"{medidas['var_horizonte']:.1%}"),
+        ("Renta variable / fija", f"{peso_rv:.0f}% / {peso_rf:.0f}%"),
+        ("Activos (efectivos)", f"{n_activos} ({medidas['activos_efectivos']:.1f})"),
+        ("Tasa libre de riesgo", f"{rf_tes:.1%}"),
+        ("Capital", capital_txt),
+    ])
 
-    # --- Sección: curva TES y renta fija ---
-    curva_cierre = fi_engine.shocks.curve_at(multi_returns.index[-1])
-    report.add_chart(f"Curva TES — Estructura Temporal (ETTI) al {multi_returns.index[-1].date()}",
-                     curva_cierre.plot_curve())
-    report.add_chart("Curva TES — Evolución por nodo", fi_engine.shocks.plot_curve_history())
-    report.add_chart("Enfoque C — Screening de bonos individuales", fi_engine.screener.plot_screening())
+    # --- Portafolio: tabla y gráficos ---
+    otros = tabla_pesos[tabla_pesos["peso_%"] <= PESO_MIN_REPORTE_PCT]
+    tabla_html = tabla_pesos_visible.set_index("activo")[["clase", "peso_%", "contribucion_riesgo_%"]
+                                                          + (["monto_COP"] if CAPITAL_INVERSION_COP else [])].copy()
+    if len(otros) and otros["peso_%"].sum() > 0:
+        fila_otros = {"clase": "", "peso_%": float(otros["peso_%"].sum()),
+                      "contribucion_riesgo_%": float(otros["contribucion_riesgo_%"].sum())}
+        if CAPITAL_INVERSION_COP:
+            fila_otros["monto_COP"] = float(otros["monto_COP"].sum())
+        tabla_html.loc[f"Otros ({int((otros['peso_%'] > 1e-4).sum())} activos, cada uno bajo "
+                       f"{PESO_MIN_REPORTE_PCT:g}%)"] = fila_otros
+    tabla_html["peso_%"] = tabla_html["peso_%"].map("{:.1f}%".format)
+    tabla_html["contribucion_riesgo_%"] = tabla_html["contribucion_riesgo_%"].map("{:.1f}%".format)
+    if CAPITAL_INVERSION_COP:
+        tabla_html["monto_COP"] = tabla_html["monto_COP"].map("{:,.0f}".format)
+    tabla_html.index.name = None
+    cap_txt = f" — capital {CAPITAL_INVERSION_COP:,.0f} COP" if CAPITAL_INVERSION_COP else ""
+    report.add_table(f"Portafolio recomendado al {fecha_cierre.date()}{cap_txt}", tabla_html)
+    report.add_chart("Peso y contribución al riesgo por activo",
+                     _fig_pesos_riesgo(tabla_pesos_visible))
+    report.add_chart("Distribución por clase y sub-clase", _fig_distribucion(dist_subclase))
+
+    # --- Rango alcanzable y frontera ---
+    nota_objetivo = f" {info_opt['nota']}" if info_opt["nota"] else ""
     report.add_table(
-        "Analítica de la Renta Fija modelada (μ, YTM, duración, convexidad)",
-        fi_bundle.analytics.drop(columns=[c for c in ("nombre",) if c in fi_bundle.analytics.columns]),
+        f"Rango alcanzable y portafolios de referencia (CVaR {objetivo.cvar_level:.0%} a "
+        f"{objetivo.horizon_days} días){nota_objetivo}",
+        _formatear_medidas(tabla_rango),
     )
+    report.add_chart("Frontera eficiente",
+                     optimizer.plot_efficient_frontier(weights_opt, objetivo.label,
+                                                       optimizer.reference_weights_))
+
+    # --- Renta fija ---
+    report.add_chart(f"Curva TES al {fecha_cierre.date()}",
+                     fi_engine.shocks.curve_at(fecha_cierre).plot_curve())
     if not fi_bundle.screening_report.empty:
-        report.add_table(
-            "Screening de bonos — veredicto por título (a la fecha de cierre)",
-            fi_bundle.screening_report[
-                ["emisor", "rating", "plazo_anios", "ytm", "duracion_mod", "spread_bp",
-                 "liquidez", "aprobado", "motivo_rechazo"]
-            ],
-        )
+        scr = fi_bundle.screening_report[
+            ["emisor", "rating", "plazo_anios", "ytm", "duracion_mod", "spread_bp",
+             "aprobado", "motivo_rechazo"]
+        ].copy()
+        scr["ytm"] = scr["ytm"].map("{:.2%}".format)
+        scr["plazo_anios"] = scr["plazo_anios"].map("{:.1f}".format)
+        scr["duracion_mod"] = scr["duracion_mod"].map("{:.2f}".format)
+        scr["spread_bp"] = scr["spread_bp"].map("{:.0f}".format)
+        scr["aprobado"] = scr["aprobado"].map({True: "sí", False: "no"})
+        scr.index.name = None
+        report.add_table("Screening de bonos individuales (a la fecha de cierre)", scr)
 
-    # --- Sección: backtest walk-forward (modo "validacion") ---
+    # --- Validación: backtest ---
     if backtester is not None:
-        if not tabla_elegibilidad.empty:
-            report.add_table(
-                "Screening dinámico — elegibilidad de cada bono en los rebalanceos",
-                tabla_elegibilidad, "{:.2f}",
-            )
-        report.add_table(
-            "Universo de mercado — elegibilidad por liquidez y cobertura en los rebalanceos",
-            tabla_universo, "{:.2f}",
-        )
-        report.add_chart("Asignación Estratégica: Total RF vs Total RV",
+        report.add_chart("Backtest — Curva de equity", backtester.plot_equity_curve())
+        report.add_chart("Backtest — Asignación RV vs RF en el tiempo",
                          backtester.plot_asset_class_evolution())
-        report.add_chart("Composición Interna de la Renta Fija (Nodos TES / ETFs / Bonos)",
-                         backtester.plot_fixed_income_breakdown())
-        report.add_chart("Renta Fija — Peso relativo dentro de la clase",
-                         backtester.plot_fixed_income_breakdown(normalize=True))
-        report.add_chart("Renta Fija — Detalle por instrumento", backtester.plot_fixed_income_assets())
-        report.add_chart("Evolución de Pesos por Activo", backtester.plot_weights_evolution())
-        report.add_chart("Curva de Equity — Backtest Walk-Forward", backtester.plot_equity_curve())
-        report.add_table("Desempeño fuera de muestra", pd.DataFrame(perf_summary, index=["valor"]).T)
-        if policy.bandas:
-            report.add_table("Cumplimiento de bandas en el backtest", backtester.band_compliance(), "{:.4f}")
+        report.add_table("Backtest — Desempeño fuera de muestra",
+                         pd.DataFrame(perf_summary, index=["valor"]).T)
 
-    # --- Sección: riesgo micro y calidad de datos ---
-    report.add_table("Métricas de riesgo micro por activo", risk_report)
-    if not tabla_liquidez.empty:
-        report.add_table("Calidad de datos — liquidez, cobertura y frescura por ticker",
-                         tabla_liquidez, "{:.3f}")
+    # --- Detalle plegado: calidad de datos y metodología ---
+    if not tabla_excluidos.empty:
+        report.add_details(
+            f"Activos no invertibles al cierre ({len(tabla_excluidos)})",
+            InteractiveReport.table_html(tabla_excluidos, "{:.0f}"),
+        )
+    report.add_details(
+        "Metodología y límites",
+        "<p><b>Datos.</b> Precios de Yahoo Finance y curva cero cupón TES en pesos del Banco de la "
+        "República (1, 5 y 10 años, completada con Nelson-Siegel). Los spreads de crédito de los bonos "
+        "se anclan a tu cotización en la fecha de los datos; hacia atrás son simulados.</p>"
+        f"<p><b>Estimación.</b> Ventana de {LOOKBACK_DIAS} días; covarianza con shrinkage Ledoit-Wolf; "
+        "retorno esperado de acciones y ETFs con Bayes-Stein; el de la renta fija es analítico "
+        "(YTM + roll-down).</p>"
+        f"<p><b>CVaR.</b> Simulación histórica con retornos {objetivo.return_freq}s continuos, sumados "
+        f"a {objetivo.horizon_days} días en ventanas móviles"
+        + (" y recentrados en el retorno esperado" if objetivo.center_on_mu else "")
+        + ". Los escenarios se solapan, así que la cola se apoya en pocos meses independientes.</p>"
+        "<p><b>Sin topes ni bandas</b> el óptimo tiende a concentrarse; el resultado es muy sensible a "
+        "los retornos esperados. Revisa los pesos antes de operar.</p>",
+    )
 
     # --- Escritura del reporte ---
     report_path = report.write(os.path.join(DIRECTORIO_SALIDA, NOMBRE_REPORTE_HTML))
@@ -3941,7 +4302,6 @@ def main() -> None:
     for alerta in alertas:
         logger.warning("ALERTA: %s", alerta)
     logger.info("Ejecución completa. Reporte interactivo: %s", report_path)
-    logger.info("Portafolio recomendado (CSV): %s", ruta_csv)
     logger.info("=" * 78)
 
 
