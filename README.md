@@ -183,3 +183,7 @@ All settings live in the **CONFIGURACIÓN (set up)** block at the top of the scr
 ## Disclaimer
 
 This code is for academic and research purposes only and does not constitute investment advice. The bonds are whatever you enter, and the simulated-curve fallback is illustrative; use official Banco de la República and price-vendor data for real analysis.
+
+## License
+
+The code is released under the [MIT License](LICENSE) © 2026 Isaac Echeverri. Market data downloaded at run time (Yahoo Finance via `yfinance`, Banco de la República's SUAMECA portal) is not part of this repository and is subject to the terms of each provider.
