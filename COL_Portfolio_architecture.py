@@ -48,26 +48,6 @@ logger = logging.getLogger("QuantPM")
 # --- Constantes globales ------------------------------------------------------
 TRADING_DAYS: int = 252
 
-
-# ==============================================================================
-#                  ⚙  CONFIGURACIÓN (SET UP) — TODO LO EDITABLE VIVE AQUÍ
-# ------------------------------------------------------------------------------
-#   1. Modo de ejecución y capital
-#   2. Ventana de análisis (fechas)
-#   3. Política de datos reales y alertas de calidad
-#   4. Universo de Renta Variable
-#   5. Universo de Renta Fija: ETFs y nodos TES
-#   6. Universo de Renta Fija: BONOS INDIVIDUALES (los llenas tú)
-#   7. Curva TES (tasa libre de riesgo y base de la renta fija)
-#   8. Criterio de optimización y objetivos (Sharpe, varianza, CVaR)
-#   9. Restricciones del portafolio (libres por defecto)
-#  10. Estimación de retornos y riesgo
-#  11. Backtest (sólo modo "validacion")
-#  12. Liquidez y cobertura de precios
-#  13. Parámetros del modelo de simulación
-#  14. Salida
-# ==============================================================================
-
 # ------------------------------------------------------------------------------
 # 1. MODO DE EJECUCIÓN Y CAPITAL
 # ------------------------------------------------------------------------------
@@ -147,58 +127,6 @@ TICKER_USDCOP: str = "COP=X"
 # ------------------------------------------------------------------------------
 # 6. UNIVERSO DE RENTA FIJA: BONOS INDIVIDUALES  (TÚ LOS LLENAS)
 # ------------------------------------------------------------------------------
-# Lista vacía = el portafolio se arma sólo con acciones, ETFs y nodos TES.
-#
-# GUÍA PARA ESCOGER QUÉ BONOS INGRESAR
-# Un bono entra al optimizador sólo si cumple los criterios de más abajo. Para no
-# perder tiempo, busca bonos que cumplan TODO esto:
-#   # Tasa fija en pesos (indexación "TF"). La curva TES del motor es nominal en
-#     pesos: un bono en UVR/IPC/IBR no es comparable con ella.
-#   # Calificación local AAA o AA+ (BONOS_MIN_RATING). Un TES se ingresa como "AAA".
-#   # Plazo residual entre 1 y 10 años desde FECHA_FIN (BONOS_PLAZO_*).
-#   # Que tenga una tasa (YTM) o un precio de mercado reciente: Precia, PiP, BVC o
-#     tu comisionista. Debe ser la del día FECHA_FIN.
-#   # Que se pueda comprar de verdad: emisión grande y que cotice seguido
-#     (puntaje de liquidez >= BONOS_MIN_LIQUIDEZ).
-#   # Spread sobre la curva TES de hasta 450 pb (BONOS_MAX_SPREAD_BP): spreads más
-#     altos indican riesgo de crédito que el calificador no está viendo.
-#   # Máximo 2 bonos del mismo emisor (BONOS_MAX_POR_EMISOR) para diversificar.
-#
-# CAMPOS DE CADA BONO (uno por diccionario)
-#   "isin"        OBLIGATORIO. Identificador único del título. En Colombia se usa el
-#                 ISIN (p. ej. "COL17CT02622"); si tienes el CUSIP, también sirve:
-#                 sólo se usa para identificar y no puede repetirse.
-#   "emisor"      OBLIGATORIO. Nombre del emisor ("Bancolombia", "ISA", ...). Se usa
-#                 para limitar cuántos bonos del mismo emisor entran.
-#   "rating"      OBLIGATORIO. Calificación local: "AAA", "AA+", "AA", "AA-", "A+", ...
-#   "cupon"       OBLIGATORIO. Tasa cupón efectiva anual en decimal (7,25% = 0.0725).
-#   "vencimiento" OBLIGATORIO. Fecha de vencimiento, formato "AAAA-MM-DD".
-#   --- Precio de mercado: pon UNO de estos tres (se usa el primero que aparezca) ---
-#   "ytm"         Tasa de mercado (YTM) efectiva anual en decimal (10,5% = 0.105).
-#                 Es la mejor opción: es lo que publican los proveedores de precios.
-#   "precio"      Precio SUCIO (con cupón corrido) por cada 100 de valor nominal.
-#   "spread_bp"   Spread en puntos básicos sobre la curva TES al mismo plazo.
-#   --- Opcionales ---
-#   "frecuencia"  Pagos de cupón por año: 1 (anual), 2 (semestral), 4 (trimestral).
-#                 Por defecto 1.
-#   "indexacion"  "TF" (tasa fija), "UVR", "IPC", "IBR". Por defecto "TF".
-#   "liquidez"    Puntaje 0 a 1 que asignas tú. Referencia: 0.8-1.0 TES de referencia
-#                 o emisión muy grande que cotiza a diario; 0.5-0.7 corporativo AAA
-#                 que cotiza varias veces por semana; 0.3-0.5 cotiza poco; < 0.3
-#                 casi no se negocia. Por defecto 0.5.
-#   "sector"      Texto libre ("Soberano", "Financiero", "Utilities", ...). Sólo informativo.
-#
-# EJEMPLO. El primer bono es real en lo que se pudo verificar en fuentes del Ministerio
-# de Hacienda: TES en pesos emitido el 27-feb-2025 con vencimiento el 27-feb-2030 y
-# cupón de 12,50%. NO se pudo verificar su ISIN: el "isin" es un marcador que debes
-# reemplazar por el ISIN real. Como es deuda soberana, su tasa de mercado es la de la
-# curva TES a su plazo: se ingresa con "spread_bp": 0 para que tome siempre la curva de
-# la fecha de los datos. Si prefieres la tasa exacta de tu proveedor, cambia "spread_bp"
-# por "ytm" (la de ESA fecha; una tasa vieja, como la de una subasta anterior, infla el
-# retorno esperado del bono y lo favorece en el optimizador).
-# La plantilla de abajo (comentada) sirve para agregar más bonos; los datos de ISIN,
-# cupón, vencimiento y tasa los consigues en el informe de la subasta de TES del
-# Ministerio de Hacienda, en la BVC o con tu comisionista (Precia / PiP).
 BONOS_UNIVERSO: List[Dict[str, object]] = [
     {
         "isin": "REEMPLAZAR-ISIN-TES-2030-02-27",
@@ -212,31 +140,17 @@ BONOS_UNIVERSO: List[Dict[str, object]] = [
         "liquidez": 0.95,
         "sector": "Soberano",
     },
-    # {
-    #     "isin": "ISIN-DEL-BONO",
-    #     "emisor": "Nombre del emisor",
-    #     "rating": "AAA",
-    #     "cupon": 0.0000,            # decimal, tasa cupón efectiva anual
-    #     "vencimiento": "AAAA-MM-DD",
-    #     "ytm": 0.0000,              # o "precio" (sucio, por 100) o "spread_bp"
-    #     "frecuencia": 1,
-    #     "indexacion": "TF",
-    #     "liquidez": 0.5,
-    #     "sector": "Financiero",
-    # },
 ]
 
 # --- Criterios de selección (filtro de política) ------------------------------
-# Un bono que no los cumpla queda fuera del optimizador y el reporte dice por qué.
-# Los de plazo, spread y emisor se vuelven a evaluar en cada fecha de decisión.
-BONOS_MIN_RATING: str = "AA+"          # Calificación mínima. AA o inferior se rechaza.
-BONOS_PLAZO_MIN_ANIOS: float = 1.0     # Plazo residual mínimo; antes de esto el bono "sale" para no llegar al vencimiento.
-BONOS_PLAZO_MAX_ANIOS: float = 10.0    # Plazo residual máximo; los bonos más largos tienen mucha duración (riesgo de tasa).
-BONOS_MIN_LIQUIDEZ: float = 0.35       # Puntaje de liquidez mínimo (campo "liquidez" de cada bono).
-BONOS_MAX_SPREAD_BP: Optional[float] = 450.0  # Spread máximo sobre la curva TES, en pb. None = sin límite.
-BONOS_MAX_POR_EMISOR: int = 2          # Máximo de bonos por emisor (si hay más, se queda el de mayor YTM ajustada por liquidez). 0 = sin límite.
-BONOS_INDEXACIONES_PERMITIDAS: Optional[Set[str]] = {"TF"}  # Indexaciones aceptadas. None = todas (no recomendado).
-BONOS_EMISORES_EXCLUIDOS: Set[str] = set()  # Emisores prohibidos por política, p. ej. {"Avianca"}.
+BONOS_MIN_RATING: str = "AA+"
+BONOS_PLAZO_MIN_ANIOS: float = 1.0
+BONOS_PLAZO_MAX_ANIOS: float = 10.0
+BONOS_MIN_LIQUIDEZ: float = 0.35
+BONOS_MAX_SPREAD_BP: Optional[float] = 450.0
+BONOS_MAX_POR_EMISOR: int = 2
+BONOS_INDEXACIONES_PERMITIDAS: Optional[Set[str]] = {"TF"}
+BONOS_EMISORES_EXCLUIDOS: Set[str] = set()
 
 BONOS_VOL_SPREAD_BP_DIARIA: float = 2.0
 

@@ -61,7 +61,7 @@ The fixed-income leg combines three approaches:
 
 - **A. TES curve nodes (`TESNodeBuilder`).** Each node is a par-coupon bond at its tenor. Its daily return is carry plus the second-order price change ΔP/P ≈ −D·Δy + ½·C·(Δy)².
 - **B. Bond ETFs / funds.** Vehicles with an observable market price, taken from the price pipeline.
-- **C. Individual bonds (`BondScreener`).** The bonds **you enter** in `BONOS_UNIVERSO` (ISIN, issuer, rating, coupon, maturity and one of YTM / dirty price / spread over TES, quoted at the closing date). The list is empty by default; the configuration block explains which bonds to look for and what each field means. A policy filter then applies:
+- **C. Individual bonds (`BondScreener`).** The bonds **you enter** in `BONOS_UNIVERSO` (ISIN, issuer, rating, coupon, maturity and one of YTM / dirty price / spread over TES, quoted at the closing date). The shipped list holds one example bond; see [Entering individual bonds](#entering-individual-bonds) for what to look for and what each field means. A policy filter then applies:
   - rating ≥ AA+ on the local scale;
   - residual maturity between 1 and 10 years;
   - liquidity score ≥ 0.35;
@@ -153,13 +153,13 @@ python COL_Portfolio_architecture.py
 
 The report is written to `outputs/` next to the script. Set the `OUTPUT_DIR` environment variable to change the location.
 
-All settings live in the **CONFIGURACIÓN (set up)** block at the top of the script, in 14 numbered sections with a comment on each line:
+All settings live in the **CONFIGURACIÓN (set up)** block at the top of the script, in 14 numbered sections. The code only carries section titles; what each setting does is explained in this README:
 1. execution mode (`recomendacion` / `validacion`) and capital in COP;
 2. date window (`FECHA_FIN = None` means today);
 3. real-data policy and data-quality alerts;
 4. equity universe;
 5. fixed-income ETFs and TES nodes;
-6. **individual bonds (`BONOS_UNIVERSO`)**, with a guide on which bonds to look for, the fields of each bond and the screening criteria;
+6. **individual bonds (`BONOS_UNIVERSO`)** and the screening criteria (see the next section);
 7. TES curve source, cache path and risk-free tenor;
 8. **optimization criterion and targets** (Sharpe, variance, CVaR); CVaR level, horizon, history window, scenarios and return frequency; and whether to ask before optimizing;
 9. portfolio constraints: optional bands and weight caps, and **minimum / maximum number of assets** and minimum position;
@@ -170,6 +170,70 @@ All settings live in the **CONFIGURACIÓN (set up)** block at the top of the scr
 14. output location.
 
 **To invest today:** leave `FECHA_FIN = None`, `MODO_EJECUCION = "recomendacion"` and `PERMITIR_DATOS_SINTETICOS = False`, set your capital, and fill `BONOS_UNIVERSO` with the quotes of that day.
+
+## Entering individual bonds
+
+`BONOS_UNIVERSO` (section 6 of the configuration) is a list of dictionaries, one per bond. An empty list builds the portfolio from stocks, ETFs and TES nodes only. A bond reaches the optimizer only if it passes the screening below, so look for bonds that meet all of this:
+
+- Fixed-rate in pesos (indexation `"TF"`). The engine's TES curve is nominal in pesos, so a UVR / IPC / IBR bond is not comparable with it.
+- Local rating AAA or AA+ (`BONOS_MIN_RATING`). A TES is entered as `"AAA"`.
+- Residual maturity between 1 and 10 years from `FECHA_FIN` (`BONOS_PLAZO_MIN_ANIOS`, `BONOS_PLAZO_MAX_ANIOS`).
+- A recent market yield (YTM) or price from Precia, PiP, BVC or your broker, for the `FECHA_FIN` date.
+- Actually tradable: a large issue that quotes often (liquidity score ≥ `BONOS_MIN_LIQUIDEZ`).
+- Spread over the TES curve up to 450 bp (`BONOS_MAX_SPREAD_BP`); higher spreads point to credit risk the rating is not showing.
+- At most 2 bonds per issuer (`BONOS_MAX_POR_EMISOR`), for diversification.
+
+**Fields of each bond**
+
+| Field | Required | Meaning |
+|---|---|---|
+| `isin` | yes | Unique identifier, e.g. `"COL17CT02622"`. A CUSIP also works. Used only to identify the bond; it cannot repeat. |
+| `emisor` | yes | Issuer name. Used to cap how many bonds of one issuer enter. |
+| `rating` | yes | Local rating: `"AAA"`, `"AA+"`, `"AA"`, `"AA-"`, `"A+"`, … |
+| `cupon` | yes | Effective annual coupon rate as a decimal (7.25% = `0.0725`). |
+| `vencimiento` | yes | Maturity date, `"YYYY-MM-DD"`. |
+| `ytm` | one of three | Effective annual market yield, decimal (10.5% = `0.105`). The best option: it is what price vendors publish. |
+| `precio` | one of three | **Dirty** price (with accrued coupon) per 100 of face value. |
+| `spread_bp` | one of three | Spread in basis points over the TES curve at the same maturity. |
+| `frecuencia` | no | Coupon payments per year: 1 (annual, default), 2, 4. |
+| `indexacion` | no | `"TF"` (default), `"UVR"`, `"IPC"`, `"IBR"`. |
+| `liquidez` | no | Score from 0 to 1 that you assign (default 0.5). 0.8–1.0: benchmark TES or a very large issue that trades daily; 0.5–0.7: AAA corporate that trades several times a week; 0.3–0.5: trades rarely; < 0.3: almost never traded. |
+| `sector` | no | Free text (`"Soberano"`, `"Financiero"`, …). Informational only. |
+
+For the market price, give one of `ytm`, `precio`, `spread_bp`; the first one found, in that order, is used.
+
+**Screening criteria** (a bond that fails is left out of the optimizer and the report says why; maturity, spread and issuer limits are re-evaluated at each decision date):
+
+| Constant | Default | Effect |
+|---|---|---|
+| `BONOS_MIN_RATING` | `"AA+"` | Minimum rating; AA or below is rejected. |
+| `BONOS_PLAZO_MIN_ANIOS` | 1.0 | Minimum residual maturity. Before it the bond "leaves" so it never reaches maturity while held. |
+| `BONOS_PLAZO_MAX_ANIOS` | 10.0 | Maximum residual maturity; longer bonds carry a lot of duration (rate risk). |
+| `BONOS_MIN_LIQUIDEZ` | 0.35 | Minimum liquidity score (the `liquidez` field). |
+| `BONOS_MAX_SPREAD_BP` | 450.0 | Maximum spread over the TES curve, in bp. `None` = no limit. |
+| `BONOS_MAX_POR_EMISOR` | 2 | Maximum bonds per issuer; if there are more, the one with the highest liquidity-adjusted YTM stays. 0 = no limit. |
+| `BONOS_INDEXACIONES_PERMITIDAS` | `{"TF"}` | Accepted indexations. `None` = all (not recommended). |
+| `BONOS_EMISORES_EXCLUIDOS` | `set()` | Issuers banned by policy, e.g. `{"Avianca"}`. |
+| `BONOS_VOL_SPREAD_BP_DIARIA` | 2.0 | Daily volatility (bp) of the simulated credit spread, scaled by illiquidity (less liquid = more volatile). Raise it to assume riskier corporates. |
+
+**The example bond.** The one that ships is real as far as could be verified from Ministerio de Hacienda sources: a TES in pesos issued on 27-Feb-2025, maturing 27-Feb-2030, with a 12.50% coupon. Its ISIN could **not** be verified: `"isin"` is a placeholder you must replace with the real one. Being sovereign debt, its market yield is the TES curve's at its maturity, so it is entered with `"spread_bp": 0` and always follows the curve of the data date. If you prefer your provider's exact yield, replace `spread_bp` with `ytm` for **that** date: a stale yield, such as the one from an older auction, inflates the bond's expected return and favors it in the optimizer.
+
+Template for adding more bonds (ISIN, coupon, maturity and yield come from the TES auction report of the Ministerio de Hacienda, from BVC, or from your broker via Precia / PiP):
+
+```python
+{
+    "isin": "ISIN-DEL-BONO",
+    "emisor": "Nombre del emisor",
+    "rating": "AAA",
+    "cupon": 0.0000,            # decimal, effective annual coupon rate
+    "vencimiento": "AAAA-MM-DD",
+    "ytm": 0.0000,              # or "precio" (dirty, per 100) or "spread_bp"
+    "frecuencia": 1,
+    "indexacion": "TF",
+    "liquidez": 0.5,
+    "sector": "Financiero",
+},
+```
 
 ## Known limitations
 
